@@ -30,6 +30,9 @@ export interface Session {
   has_total_output_tokens?: boolean;
   has_peak_context_tokens?: boolean;
   is_automated: boolean;
+  is_teammate?: boolean;
+  /** True when populated from the skinny sidebar index and not yet hydrated. */
+  is_index_only?: boolean;
   // Session signals (from backend computation)
   health_score?: number | null;
   health_grade?: string | null;
@@ -54,6 +57,31 @@ export interface Session {
 export interface SessionPage {
   sessions: Session[];
   next_cursor?: string;
+  total: number;
+}
+
+/** Skinny sidebar index row from GET /api/v1/sessions/sidebar-index. */
+export interface SidebarSessionIndexRow {
+  id: string;
+  parent_session_id?: string | null;
+  relationship_type?: string | null;
+  project: string;
+  machine: string;
+  agent: string;
+  display_name?: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  created_at: string;
+  termination_status?: string | null;
+  message_count: number;
+  user_message_count: number;
+  is_automated: boolean;
+  is_teammate?: boolean;
+}
+
+/** Matches Go SidebarSessionIndex struct. */
+export interface SidebarSessionIndexResponse {
+  sessions: SidebarSessionIndexRow[];
   total: number;
 }
 

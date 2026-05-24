@@ -651,6 +651,7 @@ func sessionPushFingerprint(
 		stringValue(sess.DeletedAt),
 		fmt.Sprintf("%d", sess.MessageCount),
 		fmt.Sprintf("%d", sess.UserMessageCount),
+		fmt.Sprintf("%t", sess.IsAutomated),
 		fmt.Sprintf("%d", sess.TotalOutputTokens),
 		fmt.Sprintf("%d", sess.PeakContextTokens),
 		fmt.Sprintf("%t", sess.HasTotalOutputTokens),

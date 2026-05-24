@@ -2,10 +2,15 @@ import { test, expect } from "@playwright/test";
 import {
   createMockSessions,
   handleSessionsRoute,
+  sessionsRoutePattern,
 } from "./helpers/mock-sessions";
+import {
+  ITEM_HEIGHT,
+} from "../src/lib/components/sidebar/session-list-utils";
 import {
   getScrollTop,
   scrollListTo,
+  waitForScrollHeight,
 } from "./helpers/virtual-list-helpers";
 import { SessionsPage } from "./pages/sessions-page";
 
@@ -13,6 +18,7 @@ const TOTAL_SESSIONS = 500;
 const DEEP_SESSIONS = 2000;
 const MIDDLE_INDEX = Math.floor(DEEP_SESSIONS / 2);
 const LAST_INDEX = DEEP_SESSIONS - 1;
+const DEEP_SCROLL_HEIGHT = DEEP_SESSIONS * ITEM_HEIGHT;
 
 /** Expected header text after all deep sessions load (en-US). */
 const DEEP_COUNT_TEXT = `${DEEP_SESSIONS.toLocaleString("en-US")} sessions`;
@@ -36,7 +42,7 @@ test.describe("Virtual list behavior", () => {
 
   test.beforeEach(async ({ page }) => {
     await page.route(
-      "**/api/v1/sessions*",
+      sessionsRoutePattern,
       handleSessionsRoute([
         { sessions, project: null },
         { sessions: deepSessions, project: "deep" },
@@ -106,6 +112,10 @@ test.describe("Virtual list behavior", () => {
       DEEP_COUNT_TEXT,
       { timeout: 15_000 },
     );
+    await waitForScrollHeight(
+      sp.sessionListScroll,
+      DEEP_SCROLL_HEIGHT,
+    );
 
     await scrollListTo(sp.sessionListScroll, "middle");
 
@@ -125,6 +135,10 @@ test.describe("Virtual list behavior", () => {
     await expect(sp.sessionListHeader).toContainText(
       DEEP_COUNT_TEXT,
       { timeout: 15_000 },
+    );
+    await waitForScrollHeight(
+      sp.sessionListScroll,
+      DEEP_SCROLL_HEIGHT,
     );
 
     await scrollListTo(sp.sessionListScroll, "bottom");

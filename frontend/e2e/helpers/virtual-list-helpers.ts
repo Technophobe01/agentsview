@@ -12,6 +12,11 @@ export function getScrollTop(locator: Locator): Promise<number> {
   return locator.evaluate((el) => el.scrollTop);
 }
 
+/** Returns the current scrollHeight of a scrollable container. */
+export function getScrollHeight(locator: Locator): Promise<number> {
+  return locator.evaluate((el) => el.scrollHeight);
+}
+
 /**
  * Scrolls a virtual list container to the given position
  * and dispatches a scroll event to trigger virtualizer updates.
@@ -32,6 +37,19 @@ export async function scrollListTo(
     }
     el.dispatchEvent(new Event("scroll"));
   }, position);
+}
+
+/**
+ * Waits until the virtual list has published enough height for
+ * programmatic scrolling to target the requested range.
+ */
+export async function waitForScrollHeight(
+  locator: Locator,
+  minHeight: number,
+): Promise<void> {
+  await expect
+    .poll(() => getScrollHeight(locator), { timeout: 5_000 })
+    .toBeGreaterThanOrEqual(minHeight);
 }
 
 /**

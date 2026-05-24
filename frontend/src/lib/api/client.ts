@@ -1,6 +1,7 @@
 import type {
   SessionPage,
   Session,
+  SidebarSessionIndexResponse,
   MessagesResponse,
   SearchResponse,
   ProjectsResponse,
@@ -186,10 +187,21 @@ export interface ListSessionsParams {
   limit?: number;
 }
 
+export type SidebarSessionIndexParams = Omit<
+  ListSessionsParams,
+  "include_children" | "cursor" | "limit"
+>;
+
 export function listSessions(
   params: ListSessionsParams = {},
 ): Promise<SessionPage> {
   return fetchJSON(`/sessions${buildQuery({ ...params })}`);
+}
+
+export function getSidebarSessionIndex(
+  params: SidebarSessionIndexParams = {},
+): Promise<SidebarSessionIndexResponse> {
+  return fetchJSON(`/sessions/sidebar-index${buildQuery({ ...params })}`);
 }
 
 export function getSession(id: string, init?: RequestInit): Promise<Session> {

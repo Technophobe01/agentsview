@@ -186,6 +186,13 @@ func TestSessionPushFingerprintDiffers(t *testing.T) {
 				return s
 			},
 		},
+		{
+			name: "automated classification change",
+			modify: func(s db.Session) db.Session {
+				s.IsAutomated = true
+				return s
+			},
+		},
 	}
 
 	for _, tc := range tests {

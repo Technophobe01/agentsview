@@ -221,6 +221,296 @@ func TestStoreListSessions_MachineMultiSelect(t *testing.T) {
 	}
 }
 
+func ensureSidebarIndexStoreSchema(
+	t *testing.T, pgURL string,
+) *Store {
+	t.Helper()
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if _, err := store.DB().Exec(`DELETE FROM messages`); err != nil {
+		t.Fatalf("clearing seed messages: %v", err)
+	}
+	if _, err := store.DB().Exec(`DELETE FROM sessions`); err != nil {
+		t.Fatalf("clearing seed sessions: %v", err)
+	}
+	return store
+}
+
+func insertSidebarIndexSession(
+	t *testing.T,
+	store *Store,
+	id string,
+	opts ...func(*sidebarIndexSessionSeed),
+) {
+	t.Helper()
+	row := sidebarIndexSessionSeed{
+		id:               id,
+		machine:          "test-machine",
+		project:          "sidebar-project",
+		agent:            "claude",
+		firstMessage:     "sidebar session",
+		startedAt:        "2026-03-12T10:00:00Z",
+		endedAt:          "2026-03-12T10:30:00Z",
+		messageCount:     3,
+		userMessageCount: 2,
+	}
+	for _, opt := range opts {
+		opt(&row)
+	}
+
+	_, err := store.DB().Exec(`
+		INSERT INTO sessions (
+			id, machine, project, agent, first_message,
+			display_name, started_at, ended_at, message_count,
+			user_message_count, parent_session_id,
+			relationship_type, is_automated
+		) VALUES (
+			$1, $2, $3, $4, $5,
+			$6, $7::timestamptz, $8::timestamptz, $9,
+			$10, $11, $12, $13
+		)
+	`, row.id, row.machine, row.project, row.agent,
+		row.firstMessage, row.displayName, row.startedAt,
+		row.endedAt, row.messageCount, row.userMessageCount,
+		row.parentSessionID, row.relationshipType,
+		row.isAutomated)
+	if err != nil {
+		t.Fatalf("inserting sidebar index session %s: %v", id, err)
+	}
+}
+
+type sidebarIndexSessionSeed struct {
+	id               string
+	machine          string
+	project          string
+	agent            string
+	firstMessage     string
+	displayName      *string
+	startedAt        string
+	endedAt          string
+	messageCount     int
+	userMessageCount int
+	parentSessionID  *string
+	relationshipType string
+	isAutomated      bool
+}
+
+func sidebarIndexRowsByID(
+	sessions []db.SidebarSessionIndexRow,
+) map[string]db.SidebarSessionIndexRow {
+	rows := make(map[string]db.SidebarSessionIndexRow, len(sessions))
+	for _, s := range sessions {
+		rows[s.ID] = s
+	}
+	return rows
+}
+
+func requireSidebarIndexIDs(
+	t *testing.T,
+	sessions []db.SidebarSessionIndexRow,
+	wantIDs []string,
+) {
+	t.Helper()
+	rows := sidebarIndexRowsByID(sessions)
+	if len(rows) != len(wantIDs) {
+		t.Fatalf("session count = %d, want %d; rows=%v",
+			len(rows), len(wantIDs), rows)
+	}
+	for _, id := range wantIDs {
+		if _, ok := rows[id]; !ok {
+			t.Fatalf("session %q missing from rows=%v", id, rows)
+		}
+	}
+}
+
+func TestStoreGetSidebarSessionIndexComputesIsTeammate(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	insertSidebarIndexSession(t, store, "teammate", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.firstMessage = `<teammate-message from="reviewer">hi`
+	})
+	insertSidebarIndexSession(t, store, "normal")
+
+	index, err := store.GetSidebarSessionIndex(
+		context.Background(), db.SessionFilter{},
+	)
+	if err != nil {
+		t.Fatalf("GetSidebarSessionIndex: %v", err)
+	}
+
+	rows := sidebarIndexRowsByID(index.Sessions)
+	if !rows["teammate"].IsTeammate {
+		t.Fatal("teammate IsTeammate = false, want true")
+	}
+	if rows["normal"].IsTeammate {
+		t.Fatal("normal IsTeammate = true, want false")
+	}
+}
+
+func TestStoreGetSidebarSessionIndexReturnsDisplayName(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	displayName := "Named sidebar session"
+	insertSidebarIndexSession(t, store, "named", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.displayName = &displayName
+	})
+
+	index, err := store.GetSidebarSessionIndex(
+		context.Background(), db.SessionFilter{},
+	)
+	if err != nil {
+		t.Fatalf("GetSidebarSessionIndex: %v", err)
+	}
+	if len(index.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(index.Sessions))
+	}
+	got := index.Sessions[0].DisplayName
+	if got == nil || *got != displayName {
+		t.Fatalf("display_name = %v, want %q", got, displayName)
+	}
+}
+
+func TestStoreGetSidebarSessionIndexExcludeAutomated(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	insertSidebarIndexSession(t, store, "normal")
+	insertSidebarIndexSession(t, store, "review", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.firstMessage = "You are a code reviewer. Review the code."
+		s.userMessageCount = 1
+		s.isAutomated = true
+	})
+
+	index, err := store.GetSidebarSessionIndex(
+		context.Background(),
+		db.SessionFilter{ExcludeAutomated: true},
+	)
+	if err != nil {
+		t.Fatalf("GetSidebarSessionIndex exclude automated: %v", err)
+	}
+	requireSidebarIndexIDs(t, index.Sessions, []string{"normal"})
+	if index.Total != 1 {
+		t.Fatalf("total = %d, want 1", index.Total)
+	}
+
+	index, err = store.GetSidebarSessionIndex(
+		context.Background(),
+		db.SessionFilter{ExcludeAutomated: false},
+	)
+	if err != nil {
+		t.Fatalf("GetSidebarSessionIndex include automated: %v", err)
+	}
+	requireSidebarIndexIDs(
+		t, index.Sessions, []string{"normal", "review"},
+	)
+}
+
+func TestStoreGetSidebarSessionIndexExcludeOneShotKeepsAutomated(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	insertSidebarIndexSession(t, store, "multi", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.userMessageCount = 5
+	})
+	insertSidebarIndexSession(t, store, "oneshot", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.userMessageCount = 1
+	})
+	insertSidebarIndexSession(t, store, "review", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.firstMessage = "You are a code reviewer. Review the code."
+		s.userMessageCount = 1
+		s.isAutomated = true
+	})
+
+	index, err := store.GetSidebarSessionIndex(
+		context.Background(),
+		db.SessionFilter{
+			ExcludeOneShot:   true,
+			ExcludeAutomated: false,
+		},
+	)
+	if err != nil {
+		t.Fatalf("GetSidebarSessionIndex: %v", err)
+	}
+	requireSidebarIndexIDs(t, index.Sessions, []string{"multi", "review"})
+}
+
+func TestStoreGetSidebarSessionIndexIncludesChildrenForMatchingRoot(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	rootID := "root"
+	subID := "sub"
+	insertSidebarIndexSession(t, store, rootID, func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.agent = "claude"
+		s.userMessageCount = 5
+	})
+	insertSidebarIndexSession(t, store, subID, func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.agent = "codex"
+		s.parentSessionID = &rootID
+		s.relationshipType = "subagent"
+	})
+	insertSidebarIndexSession(t, store, "fork", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.agent = "codex"
+		s.parentSessionID = &subID
+		s.relationshipType = "fork"
+	})
+	insertSidebarIndexSession(t, store, "other", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.agent = "codex"
+		s.userMessageCount = 5
+	})
+
+	index, err := store.GetSidebarSessionIndex(
+		context.Background(), db.SessionFilter{Agent: "claude"},
+	)
+	if err != nil {
+		t.Fatalf("GetSidebarSessionIndex: %v", err)
+	}
+	requireSidebarIndexIDs(
+		t, index.Sessions, []string{"root", "sub", "fork"},
+	)
+}
+
 func TestStoreGetSession(t *testing.T) {
 	pgURL := testPGURL(t)
 	ensureStoreSchema(t, pgURL)

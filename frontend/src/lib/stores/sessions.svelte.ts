@@ -1,17 +1,46 @@
 import * as api from "../api/client.js";
-import type { Session, ProjectInfo, AgentInfo } from "../api/types.js";
+import type { DataChangedEvent } from "../api/client.js";
+import type {
+  Session,
+  ProjectInfo,
+  AgentInfo,
+  SidebarSessionIndexRow,
+} from "../api/types.js";
 import { sync } from "./sync.svelte.js";
 import { events } from "./events.svelte.js";
 
 const SESSION_PAGE_SIZE = 500;
+const SIDEBAR_HYDRATION_CONCURRENCY = 6;
+const LIVE_REFRESH_DEBOUNCE_MS = 300;
+const SAFETY_NET_REFRESH_MS = 5 * 60 * 1000;
+
+export interface SessionGroupInput {
+  id: string;
+  parent_session_id?: string | null;
+  relationship_type?: string | null;
+  project: string;
+  machine: string;
+  agent: string;
+  first_message?: string | null;
+  display_name?: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  created_at: string;
+  termination_status?: string | null;
+  message_count: number;
+  user_message_count?: number;
+  is_automated?: boolean;
+  is_teammate?: boolean;
+  is_index_only?: boolean;
+}
 
 export interface SessionGroup {
   key: string;
   project: string;
-  sessions: Session[];
+  sessions: SessionGroupInput[];
   /** Unfiltered session list for ancestry classification.
    *  Set when a filter (e.g. starred) removes sessions from the group. */
-  allSessions?: Session[];
+  allSessions?: SessionGroupInput[];
   primarySessionId: string;
   totalMessages: number;
   firstMessage: string | null;
@@ -204,13 +233,22 @@ class SessionsStore {
   private machinesLoaded: boolean = false;
   private machinesPromise: Promise<void> | null = null;
   private machinesVersion: number = 0;
+  private sidebarHydrationInflightByVersion = new Map<
+    number,
+    Map<string, Promise<void>>
+  >();
+  private sidebarHydrationEpochByVersion = new Map<number, number>();
+  private sidebarHydrationQueue: Array<() => void> = [];
+  private sidebarHydrationActive = 0;
 
   private liveRefreshStarted = false;
   private unsubEvents: (() => void) | null = null;
+  private liveRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private safetyNetTimer: ReturnType<typeof setInterval> | null = null;
 
   get activeSession(): Session | undefined {
-    return this.sessions.find((s) => s.id === this.activeSessionId);
+    const session = this.sessions.find((s) => s.id === this.activeSessionId);
+    return session?.is_index_only ? undefined : session;
   }
 
   get groupedSessions(): SessionGroup[] {
@@ -246,7 +284,6 @@ class SessionsStore {
         f.minUserMessages > 0 ? f.minUserMessages : undefined,
       include_one_shot: f.includeOneShot || undefined,
       include_automated: f.includeAutomated || undefined,
-      include_children: true,
     };
   }
 
@@ -272,44 +309,33 @@ class SessionsStore {
     saveFilters(this.filters);
     this.startLiveRefresh();
     const version = ++this.loadVersion;
-    // Only flip loading=true when we don't already have data to show.
-    // Live-event refetches and filter-change refetches keep the
-    // existing list visible and swap it in place when data arrives,
-    // instead of flashing to a loading indicator.
-    if (this.sessions.length === 0) this.loading = true;
-    // Preserve old data during reload — clearing eagerly
-    // causes a flash because the sidebar and content area
-    // briefly see an empty session list.
+    const indexVersion = this.sidebarIndexVersion + 1;
+    // Keep the existing list visible during reloads, but mark
+    // loading=true so large filter expansions expose that more
+    // pages are still being fetched after page 1 is published.
+    this.loading = true;
+    // Preserve old data during reload — clearing eagerly causes
+    // a flash because the sidebar and content area briefly see
+    // an empty session list.
     const prev = {
       sessions: this.sessions,
       nextCursor: this.nextCursor,
       total: this.total,
     };
     try {
-      let cursor: string | undefined = undefined;
-      let loaded: Session[] = [];
+      const index = await api.getSidebarSessionIndex(this.apiParams);
+      if (this.loadVersion !== version) return;
 
-      for (;;) {
-        if (this.loadVersion !== version) return;
-        const page = await api.listSessions({
-          ...this.apiParams,
-          cursor,
-          limit: SESSION_PAGE_SIZE,
-        });
-        if (this.loadVersion !== version) return;
-
-        if (page.sessions.length === 0) break;
-        loaded = [...loaded, ...page.sessions];
-        cursor = page.next_cursor ?? undefined;
-        if (!cursor) break;
-      }
-
-      // Swap atomically once all pages have loaded. Updating
-      // this.sessions and this.total after each page causes the
-      // sidebar session count to visibly tick up as pages arrive.
-      this.sessions = loaded;
+      this.sidebarIndexVersion = indexVersion;
+      this.hydratedSessionsByVersion.set(indexVersion, new Map());
+      this.sidebarHydrationEpochByVersion.set(indexVersion, 0);
+      this.pruneSidebarHydrationVersions(indexVersion);
+      const previousById = new Map(prev.sessions.map((s) => [s.id, s]));
+      this.sessions = index.sessions.map((row) =>
+        sidebarIndexRowToSession(row, previousById.get(row.id))
+      );
       this.nextCursor = null;
-      this.total = loaded.length;
+      this.total = index.total;
     } catch {
       // Restore previous state so a transient failure
       // doesn't wipe the visible session list.
@@ -323,6 +349,110 @@ class SessionsStore {
         this.loading = false;
       }
     }
+  }
+
+  sidebarIndexVersion: number = $state(0);
+  hydratedSessionsByVersion: Map<number, Map<string, Session>> =
+    $state(new Map());
+
+  private pruneSidebarHydrationVersions(retainVersion: number) {
+    for (const version of this.hydratedSessionsByVersion.keys()) {
+      if (version !== retainVersion) {
+        this.hydratedSessionsByVersion.delete(version);
+      }
+    }
+    for (const version of this.sidebarHydrationInflightByVersion.keys()) {
+      if (version !== retainVersion) {
+        this.sidebarHydrationInflightByVersion.delete(version);
+      }
+    }
+    for (const version of this.sidebarHydrationEpochByVersion.keys()) {
+      if (version !== retainVersion) {
+        this.sidebarHydrationEpochByVersion.delete(version);
+      }
+    }
+  }
+
+  async hydrateVisibleSessions(
+    ids: string[],
+    version: number = this.sidebarIndexVersion,
+  ) {
+    const uniqueIds = [...new Set(ids)];
+    const cache =
+      this.hydratedSessionsByVersion.get(version) ?? new Map<string, Session>();
+    this.hydratedSessionsByVersion.set(version, cache);
+    const inflight = this.sidebarHydrationInflightByVersion.get(version) ??
+      new Map<string, Promise<void>>();
+    this.sidebarHydrationInflightByVersion.set(version, inflight);
+    const epoch = this.sidebarHydrationEpochByVersion.get(version) ?? 0;
+
+    await Promise.all(uniqueIds.map((id) => {
+      if (cache.has(id)) return;
+      const existing = inflight.get(id);
+      if (existing) return existing;
+
+      const promise = this.runSidebarHydration(async () => {
+        try {
+          const hydrated = await api.getSession(id);
+          if (
+            version !== this.sidebarIndexVersion ||
+            epoch !== (this.sidebarHydrationEpochByVersion.get(version) ?? 0)
+          ) {
+            return;
+          }
+          cache.set(id, hydrated);
+          this.mergeHydratedSession(hydrated);
+        } catch {
+          // Visible hydration is best-effort; the skinny row remains usable.
+        } finally {
+          inflight.delete(id);
+        }
+      });
+      inflight.set(id, promise);
+      return promise;
+    }));
+  }
+
+  private async runSidebarHydration(task: () => Promise<void>): Promise<void> {
+    if (this.sidebarHydrationActive >= SIDEBAR_HYDRATION_CONCURRENCY) {
+      await new Promise<void>((resolve) => {
+        this.sidebarHydrationQueue.push(resolve);
+      });
+    }
+
+    this.sidebarHydrationActive++;
+    try {
+      await task();
+    } finally {
+      this.sidebarHydrationActive--;
+      this.sidebarHydrationQueue.shift()?.();
+    }
+  }
+
+  private mergeHydratedSession(hydrated: Session) {
+    const idx = this.sessions.findIndex((s) => s.id === hydrated.id);
+    if (idx < 0) return;
+    const current = this.sessions[idx]!;
+    this.sessions[idx] = {
+      ...current,
+      ...hydrated,
+      display_name: hydrated.display_name ?? current.display_name,
+      is_teammate: hydrated.is_teammate ?? current.is_teammate,
+      is_index_only: false,
+    };
+  }
+
+  private invalidateHydratedSessionDetails() {
+    const version = this.sidebarIndexVersion;
+    this.hydratedSessionsByVersion.set(version, new Map());
+    this.sidebarHydrationInflightByVersion.delete(version);
+    this.sidebarHydrationEpochByVersion.set(
+      version,
+      (this.sidebarHydrationEpochByVersion.get(version) ?? 0) + 1,
+    );
+    this.signalDetailCache.clear();
+    this.signalDetailInflight.clear();
+    this.signalDetailLoading = false;
   }
 
   async loadMore() {
@@ -445,6 +575,7 @@ class SessionsStore {
 
   selectSession(id: string) {
     this.setActiveSession(id);
+    void this.hydrateSelectedIndexOnlySession(id);
   }
 
   /**
@@ -454,16 +585,29 @@ class SessionsStore {
   async navigateToSession(id: string) {
     this.setActiveSession(id);
     const existing = this.sessions.find((s) => s.id === id);
-    if (!existing) {
-      try {
-        const session = await api.getSession(id);
-        if (this.activeSessionId === id) {
+    if (existing) {
+      await this.hydrateSelectedIndexOnlySession(id);
+      return;
+    }
+    try {
+      const session = await api.getSession(id);
+      if (this.activeSessionId === id) {
+        const idx = this.sessions.findIndex((s) => s.id === id);
+        if (idx >= 0) {
+          this.mergeHydratedSession(session);
+        } else {
           this.sessions = [...this.sessions, session];
         }
-      } catch {
-        // Session not found — selection stands without metadata
       }
+    } catch {
+      // Session not found — selection stands without metadata
     }
+  }
+
+  private async hydrateSelectedIndexOnlySession(id: string) {
+    const existing = this.sessions.find((s) => s.id === id);
+    if (!existing?.is_index_only) return;
+    await this.hydrateVisibleSessions([id]);
   }
 
   deselectSession() {
@@ -485,7 +629,7 @@ class SessionsStore {
       }
       const idx = this.sessions.findIndex((s) => s.id === id);
       if (idx >= 0) {
-        this.sessions[idx] = session;
+        this.mergeHydratedSession(session);
       }
     } catch {
       // Session may have been deleted
@@ -586,12 +730,16 @@ class SessionsStore {
       // an unstarred session while starred-only filter is on) — jump to
       // an edge so the keyboard shortcut doesn't silently fail.
       const edge = delta > 0 ? 0 : list.length - 1;
-      this.setActiveSession(list[edge]!.id);
+      const id = list[edge]!.id;
+      this.setActiveSession(id);
+      void this.hydrateSelectedIndexOnlySession(id);
       return;
     }
     const next = idx + delta;
     if (next >= 0 && next < list.length) {
-      this.setActiveSession(list[next]!.id);
+      const id = list[next]!.id;
+      this.setActiveSession(id);
+      void this.hydrateSelectedIndexOnlySession(id);
     }
   }
 
@@ -845,19 +993,43 @@ class SessionsStore {
   private startLiveRefresh() {
     if (this.liveRefreshStarted) return;
     this.liveRefreshStarted = true;
-    this.unsubEvents = events.subscribeDebounced(
-      () => { this.load(); },
-    );
+    this.unsubEvents = events.subscribe((event) => {
+      this.handleLiveRefreshEvent(event);
+    });
     this.safetyNetTimer = setInterval(
       () => { this.load(); },
-      5 * 60 * 1000,
+      SAFETY_NET_REFRESH_MS,
     );
+  }
+
+  private handleLiveRefreshEvent(event: DataChangedEvent) {
+    if (event.scope === "messages") {
+      this.invalidateHydratedSessionDetails();
+      return;
+    }
+    if (event.scope === "sessions" || event.scope === "sync") {
+      this.scheduleIndexRefresh();
+    }
+  }
+
+  private scheduleIndexRefresh() {
+    if (this.liveRefreshTimer !== null) {
+      clearTimeout(this.liveRefreshTimer);
+    }
+    this.liveRefreshTimer = setTimeout(() => {
+      this.liveRefreshTimer = null;
+      this.load();
+    }, LIVE_REFRESH_DEBOUNCE_MS);
   }
 
   dispose() {
     if (this.unsubEvents) {
       this.unsubEvents();
       this.unsubEvents = null;
+    }
+    if (this.liveRefreshTimer !== null) {
+      clearTimeout(this.liveRefreshTimer);
+      this.liveRefreshTimer = null;
     }
     if (this.safetyNetTimer !== null) {
       clearInterval(this.safetyNetTimer);
@@ -869,6 +1041,55 @@ class SessionsStore {
 
 export function createSessionsStore(): SessionsStore {
   return new SessionsStore();
+}
+
+function sidebarIndexRowToSession(
+  row: SidebarSessionIndexRow,
+  existing?: Session,
+): Session {
+  const skinny: Session = {
+    id: row.id,
+    project: row.project,
+    machine: row.machine,
+    agent: row.agent,
+    first_message: null,
+    display_name: row.display_name ?? null,
+    started_at: row.started_at,
+    ended_at: row.ended_at,
+    message_count: row.message_count,
+    user_message_count: row.user_message_count,
+    parent_session_id: row.parent_session_id ?? undefined,
+    relationship_type: row.relationship_type ?? undefined,
+    termination_status: row.termination_status ?? null,
+    total_output_tokens: 0,
+    peak_context_tokens: 0,
+    has_total_output_tokens: false,
+    has_peak_context_tokens: false,
+    is_automated: row.is_automated,
+    is_teammate: row.is_teammate ?? false,
+    is_index_only: true,
+    created_at: row.created_at,
+  };
+  if (!existing || existing.is_index_only) return skinny;
+  return {
+    ...skinny,
+    ...existing,
+    project: skinny.project,
+    machine: skinny.machine,
+    agent: skinny.agent,
+    display_name: skinny.display_name,
+    started_at: skinny.started_at,
+    ended_at: skinny.ended_at,
+    message_count: skinny.message_count,
+    user_message_count: skinny.user_message_count,
+    parent_session_id: skinny.parent_session_id,
+    relationship_type: skinny.relationship_type,
+    termination_status: skinny.termination_status,
+    is_automated: skinny.is_automated,
+    is_teammate: skinny.is_teammate ?? existing.is_teammate,
+    is_index_only: false,
+    created_at: skinny.created_at,
+  };
 }
 
 function maxString(a: string | null, b: string | null): string | null {
@@ -996,7 +1217,7 @@ export function getSessionStatus(
  */
 function findRoot(
   id: string,
-  byId: Map<string, Session>,
+  byId: Map<string, SessionGroupInput>,
   rootCache: Map<string, string>,
 ): string {
   const cached = rootCache.get(id);
@@ -1022,8 +1243,10 @@ function findRoot(
   return cur;
 }
 
-export function buildSessionGroups(sessions: Session[]): SessionGroup[] {
-  const byId = new Map<string, Session>();
+export function buildSessionGroups(
+  sessions: SessionGroupInput[],
+): SessionGroup[] {
+  const byId = new Map<string, SessionGroupInput>();
   for (const s of sessions) {
     byId.set(s.id, s);
   }
@@ -1065,8 +1288,8 @@ export function buildSessionGroups(sessions: Session[]): SessionGroup[] {
   // A session with <teammate-message in first_message is always a child;
   // if parent_session_id is missing, adopt it into the nearest non-teammate
   // root group in the same project (no time limit).
-  const isTeammateSession = (s: Session) =>
-    s.first_message?.includes("<teammate-message") ?? false;
+  const isTeammateSession = (s: SessionGroupInput) =>
+    s.is_teammate ?? s.first_message?.includes("<teammate-message") ?? false;
 
   const keysToRemove = new Set<string>();
 

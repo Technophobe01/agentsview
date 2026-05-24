@@ -1,5 +1,7 @@
-import type { Session } from "../../api/types.js";
-import type { SessionGroup } from "../../stores/sessions.svelte.js";
+import type {
+  SessionGroup,
+  SessionGroupInput,
+} from "../../stores/sessions.svelte.js";
 
 export const ITEM_HEIGHT = 42;
 export const CHILD_ITEM_HEIGHT = 34;
@@ -26,7 +28,7 @@ export interface DisplayItem {
   count: number;
   group?: SessionGroup;
   /** For child items within an expanded continuation chain. */
-  session?: Session;
+  session?: SessionGroupInput;
   /** True when this is a child session inside an expanded group. */
   isChild?: boolean;
   /** Nesting depth: 0 = root, 1 = child/team-group, 2 = teammate. */
@@ -60,7 +62,7 @@ export function getInitialGroupMode(): GroupMode {
  * pick the most recently active session.
  */
 export function selectPrimaryId(
-  sessions: Session[],
+  sessions: SessionGroupInput[],
   groupKey: string,
 ): string {
   if (sessions.length === 0) return groupKey;
@@ -123,8 +125,10 @@ export function buildAgentSections(
 }
 
 /** Check if a session is a teammate (received a <teammate-message>). */
-function isTeammateByMessage(s: Session): boolean {
-  return s.first_message?.includes("<teammate-message") ?? false;
+function isTeammateByMessage(s: SessionGroupInput): boolean {
+  return s.is_teammate
+    ?? s.first_message?.includes("<teammate-message")
+    ?? false;
 }
 
 /**
@@ -133,12 +137,15 @@ function isTeammateByMessage(s: Session): boolean {
  * `<teammate-message>` tag themselves, but they belong to the
  * same teammate chain.
  */
-function isTeammate(s: Session, allSessions: Session[]): boolean {
+function isTeammate(
+  s: SessionGroupInput,
+  allSessions: SessionGroupInput[],
+): boolean {
   if (isTeammateByMessage(s)) return true;
   // Walk up the parent chain within the group to inherit.
   if (s.parent_session_id) {
     const visited = new Set<string>();
-    let cur: Session | undefined = s;
+    let cur: SessionGroupInput | undefined = s;
     while (cur?.parent_session_id && !visited.has(cur.id)) {
       visited.add(cur.id);
       const parent = allSessions.find((p) => p.id === cur!.parent_session_id);
@@ -154,7 +161,7 @@ function isTeammate(s: Session, allSessions: Session[]): boolean {
  * Check if a session is a subagent (has relationship_type === "subagent").
  * Continuation/fork sessions are NOT subagents.
  */
-function isSubagent(s: Session): boolean {
+function isSubagent(s: SessionGroupInput): boolean {
   return s.relationship_type === "subagent";
 }
 
@@ -166,13 +173,13 @@ function isSubagent(s: Session): boolean {
  * being miscategorised as plain continuations.
  */
 export function isSubagentDescendant(
-  s: Session,
-  groupSessions: Session[],
+  s: SessionGroupInput,
+  groupSessions: SessionGroupInput[],
 ): boolean {
   if (isSubagent(s)) return true;
   if (!s.parent_session_id) return false;
   const visited = new Set<string>();
-  let cur: Session | undefined = s;
+  let cur: SessionGroupInput | undefined = s;
   while (cur?.parent_session_id && !visited.has(cur.id)) {
     visited.add(cur.id);
     const parent = groupSessions.find(
@@ -190,7 +197,10 @@ export function isSubagentDescendant(
  * descendant, not a teammate).  These render without a sub-group
  * header or under a "Continuations" label.
  */
-function isContinuation(s: Session, allSessions: Session[]): boolean {
+function isContinuation(
+  s: SessionGroupInput,
+  allSessions: SessionGroupInput[],
+): boolean {
   return !isSubagentDescendant(s, allSessions) && !isTeammate(s, allSessions);
 }
 
@@ -235,9 +245,9 @@ function emitGroupItems(
   // filtered-out ancestors don't break the parent-chain walk.
   const children = g.sessions.filter((s) => s.id !== g.primarySessionId);
   const ancestryPool = g.allSessions ?? g.sessions;
-  const subagents: Session[] = [];
-  const teammates: Session[] = [];
-  const continuations: Session[] = [];
+  const subagents: SessionGroupInput[] = [];
+  const teammates: SessionGroupInput[] = [];
+  const continuations: SessionGroupInput[] = [];
   for (const s of children) {
     if (isSubagentDescendant(s, ancestryPool)) {
       subagents.push(s);
@@ -250,7 +260,7 @@ function emitGroupItems(
 
   // Sort each child group most-recent-first so the sidebar
   // matches the main session list ordering convention.
-  const byRecencyDesc = (a: Session, b: Session) => {
+  const byRecencyDesc = (a: SessionGroupInput, b: SessionGroupInput) => {
     const ka = a.ended_at ?? a.started_at ?? a.created_at;
     const kb = b.ended_at ?? b.started_at ?? b.created_at;
     return ka > kb ? -1 : ka < kb ? 1 : 0;

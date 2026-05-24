@@ -1,6 +1,8 @@
 <script lang="ts">
-  import type { Session } from "../../api/types.js";
-  import { sessions } from "../../stores/sessions.svelte.js";
+  import {
+    sessions,
+    type SessionGroupInput,
+  } from "../../stores/sessions.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
   import { agentColor as getAgentColor, agentLabel } from "../../utils/agents.js";
@@ -11,7 +13,7 @@
   import StatusDot from "../common/StatusDot.svelte";
 
   interface Props {
-    session: Session;
+    session: SessionGroupInput;
     continuationCount?: number;
     groupSessionIds?: string[];
     /** Optional full session objects in this row's group. When
@@ -21,7 +23,7 @@
      * instead of decaying to stale. The parent's parser status
      * still wins over freshness for awaiting_user (a fork running
      * in parallel doesn't change that the parent is waiting). */
-    groupSessions?: Session[];
+    groupSessions?: SessionGroupInput[];
     hideAgent?: boolean;
     hideProject?: boolean;
     /** Render in compact mode (smaller, used for child sessions). */
@@ -81,7 +83,9 @@
 
   /** Whether this session is a team member (received a <teammate-message>). */
   let isTeamSession = $derived(
-    session.first_message?.includes("<teammate-message") ?? false,
+    session.is_teammate
+      ?? session.first_message?.includes("<teammate-message")
+      ?? false,
   );
 
   /**
