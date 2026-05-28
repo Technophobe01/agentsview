@@ -2,11 +2,11 @@ package pricing
 
 // FallbackVersion must be bumped whenever FallbackPricing
 // rates change so the startup seeder knows to re-upsert.
-const FallbackVersion = "2026-04-13"
+const FallbackVersion = "2026-05-28"
 
 // FallbackPricing returns hardcoded pricing for key Claude
 // models. Used when the LiteLLM fetch fails.
-// Prices in USD per million tokens, current as of 2026-04.
+// Prices in USD per million tokens, current as of 2026-05.
 func FallbackPricing() []ModelPricing {
 	return []ModelPricing{
 		// Current model names (used by Claude Code / Codex)
@@ -19,6 +19,16 @@ func FallbackPricing() []ModelPricing {
 		},
 		{
 			ModelPattern:         "claude-opus-4-6",
+			InputPerMTok:         5.0,
+			OutputPerMTok:        25.0,
+			CacheCreationPerMTok: 6.25,
+			CacheReadPerMTok:     0.50,
+		},
+		{
+			// Opus 4.8 launched at the Opus 4.6/4.7 rates and is
+			// not yet in the LiteLLM catalog, so it ships here so
+			// usage is priced until LiteLLM adds it.
+			ModelPattern:         "claude-opus-4-8",
 			InputPerMTok:         5.0,
 			OutputPerMTok:        25.0,
 			CacheCreationPerMTok: 6.25,

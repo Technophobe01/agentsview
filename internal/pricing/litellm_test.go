@@ -97,6 +97,7 @@ func TestFallbackPricing(t *testing.T) {
 	required := map[string]bool{
 		"claude-sonnet-4-6":         false,
 		"claude-opus-4-6":           false,
+		"claude-opus-4-8":           false,
 		"claude-haiku-4-5-20251001": false,
 		"claude-sonnet-4-20250514":  false,
 		"claude-opus-4-20250514":    false,
