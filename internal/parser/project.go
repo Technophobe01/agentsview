@@ -435,14 +435,7 @@ func findGitRepoRoot(ctx context.Context, cwd string) string {
 		cwdMissing = true
 		dir = filepath.Dir(dir)
 	}
-
-	if !cwdMissing {
-		opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if root, err := gitrepo.MainRoot(opCtx, dir); err == nil {
-			return root
-		}
-	}
+	startDir := dir
 
 	// When the original path is gone, walk up to the first
 	// existing ancestor and check its children for worktree
@@ -466,29 +459,58 @@ func findGitRepoRoot(ctx context.Context, cwd string) string {
 		}
 	}
 
+	root, conservative := findGitRepoRootLocal(dir)
+	if root != "" && !conservative {
+		return root
+	}
+	if !cwdMissing {
+		if gitRoot := gitMainRoot(ctx, startDir); gitRoot != "" {
+			return gitRoot
+		}
+	}
+	return root
+}
+
+func findGitRepoRootLocal(dir string) (root string, conservative bool) {
 	for {
 		gitPath := filepath.Join(dir, ".git")
 		info, err := osStat(gitPath)
 		if err == nil {
 			if info.IsDir() {
-				return dir
+				return dir, false
 			}
 			if info.Mode().IsRegular() {
 				if root := repoRootFromGitFile(dir, gitPath); root != "" {
-					return root
+					if root == dir {
+						return root, true
+					}
+					return root, false
 				}
 				// Keep conservative fallback for gitfile repos
 				// when metadata cannot be parsed.
-				return dir
+				return dir, true
 			}
 		}
 
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return ""
+			return "", false
 		}
 		dir = parent
 	}
+}
+
+func gitMainRoot(ctx context.Context, dir string) string {
+	if ctx == nil || dir == "" {
+		return ""
+	}
+	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	root, err := gitrepo.MainRoot(opCtx, dir)
+	if err != nil {
+		return ""
+	}
+	return root
 }
 
 // repoRootFromSiblings checks child directories of dir for

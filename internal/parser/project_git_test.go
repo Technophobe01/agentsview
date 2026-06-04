@@ -106,6 +106,98 @@ func TestExtractProjectFromCwdWithBranchContext_GitWorktreeMainRoot(t *testing.T
 		"kit-backed worktree resolution should use the main repo name")
 }
 
+func TestExtractProjectFromCwdPlainRepoDoesNotInvokeGit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell git shim")
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	mustMkdirAll(t, binDir)
+	marker := filepath.Join(root, "git-invoked")
+	fakeGit := filepath.Join(binDir, "git")
+	mustWriteFile(t, fakeGit, "#!/bin/sh\n: > "+shellQuote(marker)+"\nexit 1\n")
+	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	repo := filepath.Join(root, "plain-repo")
+	subdir := filepath.Join(repo, "internal", "parser")
+	mustMkdirAll(t, filepath.Join(repo, ".git"))
+	mustMkdirAll(t, subdir)
+
+	assert.Equal(t, "plain_repo", ExtractProjectFromCwd(subdir))
+	assert.NoFileExists(t, marker, "plain .git directory should resolve without invoking git")
+}
+
+func TestExtractProjectFromCwdFallsBackToGitWhenLocalWalkMisses(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell git shim")
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	mustMkdirAll(t, binDir)
+	gitLog := filepath.Join(root, "git-log")
+	repo := filepath.Join(root, "virtual-repo")
+	cwd := filepath.Join(repo, "internal", "parser")
+	mustMkdirAll(t, cwd)
+
+	fakeGit := filepath.Join(binDir, "git")
+	mustWriteFile(t, fakeGit, "#!/bin/sh\n"+
+		"echo \"$*\" >> "+shellQuote(gitLog)+"\n"+
+		"case \"$*\" in\n"+
+		"  'rev-parse --git-dir') echo .git ;;\n"+
+		"  'rev-parse --git-common-dir') echo .git ;;\n"+
+		"  'rev-parse --show-toplevel') echo "+shellQuote(repo)+" ;;\n"+
+		"  *) exit 1 ;;\n"+
+		"esac\n")
+	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	assert.Equal(t, "virtual_repo",
+		ExtractProjectFromCwdWithBranchContext(context.Background(), cwd, ""))
+	assert.FileExists(t, gitLog, "git fallback should be used when local walk misses")
+}
+
+func TestExtractProjectFromCwdTriesGitBeforeConservativeGitFileFallback(
+	t *testing.T,
+) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell git shim")
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	mustMkdirAll(t, binDir)
+	gitLog := filepath.Join(root, "git-log")
+	mainRepo := filepath.Join(root, "main-repo")
+	worktree := filepath.Join(root, "feature-worktree")
+	cwd := filepath.Join(worktree, "internal", "parser")
+	commonDir := filepath.Join(mainRepo, ".git")
+	externalGitDir := filepath.Join(root, "bare-common", "worktrees", "feature")
+	mustMkdirAll(t, commonDir)
+	mustMkdirAll(t, externalGitDir)
+	mustMkdirAll(t, cwd)
+	mustWriteFile(t, filepath.Join(worktree, ".git"),
+		"gitdir: "+externalGitDir+"\n")
+
+	fakeGit := filepath.Join(binDir, "git")
+	mustWriteFile(t, fakeGit, "#!/bin/sh\n"+
+		"echo \"$*\" >> "+shellQuote(gitLog)+"\n"+
+		"case \"$*\" in\n"+
+		"  'rev-parse --git-dir') echo "+shellQuote(externalGitDir)+" ;;\n"+
+		"  'rev-parse --git-common-dir') echo "+shellQuote(commonDir)+" ;;\n"+
+		"  *) exit 1 ;;\n"+
+		"esac\n")
+	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	assert.Equal(t, "main_repo",
+		ExtractProjectFromCwdWithBranchContext(context.Background(), cwd, ""))
+	assert.FileExists(t, gitLog,
+		"git fallback should run before accepting conservative gitfile root")
+}
+
 func TestExtractProjectFromCwd_DeletedNestedWorktree(t *testing.T) {
 	// Simulates a nested worktree layout where the session's
 	// worktree has been deleted but a sibling worktree still
@@ -589,6 +681,10 @@ func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644),
 		"WriteFile(%q)", path)
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 func skipIfNoGit(t *testing.T) {
