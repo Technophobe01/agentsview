@@ -77,6 +77,7 @@ type sessionFilterInput struct {
 	Termination      string           `query:"termination" doc:"Filter by termination reason"`
 	MinToolFailures  optionalIntParam `query:"min_tool_failures" minimum:"0" doc:"Minimum tool failure count"`
 	HasSecret        bool             `query:"has_secret" doc:"Filter sessions with secret findings"`
+	Starred          bool             `query:"starred" doc:"Filter sessions by starred status"`
 }
 
 type messageListInput struct {
@@ -117,6 +118,7 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 		Limit:            limit,
 		Termination:      in.Termination,
 		HasSecret:        in.HasSecret,
+		Starred:          in.Starred,
 	}
 	if in.MinToolFailures.IsSet {
 		filter.MinToolFailures = &in.MinToolFailures.Value
@@ -127,6 +129,10 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, error) {
 	if err := validateDateFilterValues(in.Date, in.DateFrom, in.DateTo, in.ActiveSince); err != nil {
 		return db.SessionFilter{}, err
+	}
+	limit := 0
+	if in.Limit > 0 {
+		limit = clampLimit(in.Limit, db.DefaultSessionLimit, db.MaxSessionLimit)
 	}
 	return db.SessionFilter{
 		Project:          in.Project,
@@ -143,7 +149,10 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 		ExcludeOneShot:   !in.IncludeOneShot,
 		ExcludeAutomated: !in.IncludeAutomated,
 		IncludeChildren:  includeChildren,
+		Cursor:           in.Cursor,
+		Limit:            limit,
 		Termination:      in.Termination,
+		Starred:          in.Starred,
 	}, nil
 }
 
@@ -175,6 +184,9 @@ func (s *Server) humaSidebarSessionIndex(
 	}
 	index, err := s.db.GetSidebarSessionIndex(ctx, filter)
 	if err != nil {
+		if errors.Is(err, db.ErrInvalidCursor) {
+			return nil, apiError(http.StatusBadRequest, "invalid cursor")
+		}
 		return nil, serverError(err)
 	}
 	return &jsonOutput[db.SidebarSessionIndex]{Body: index}, nil

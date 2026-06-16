@@ -282,7 +282,59 @@ describe("UsageStore session filter params", () => {
     );
   });
 
-  it("waits for summary before requesting follow-up usage data", async () => {
+  it("records full refresh time and clears new-data hints", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-06-15T16:00:00Z"));
+      const { usage } = await loadStore();
+
+      await usage.fetchAll();
+
+      expect(usage.lastUpdatedAt).toBe(
+        new Date("2026-06-15T16:00:00Z").getTime(),
+      );
+
+      usage.markNewData();
+      expect(usage.hasNewData).toBe(true);
+
+      vi.setSystemTime(new Date("2026-06-15T16:03:00Z"));
+      await usage.fetchAll();
+
+      expect(usage.lastUpdatedAt).toBe(
+        new Date("2026-06-15T16:03:00Z").getTime(),
+      );
+      expect(usage.hasNewData).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not mark cached partial refresh failures as current", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.setSystemTime(new Date("2026-06-15T16:00:00Z"));
+      const { usage } = await loadStore();
+
+      await usage.fetchAll();
+      const previousUpdatedAt = usage.lastUpdatedAt;
+
+      usage.markNewData();
+      usageServiceMocks.getApiV1UsageTopSessions
+        .mockRejectedValueOnce(new Error("top sessions failed"));
+
+      vi.setSystemTime(new Date("2026-06-15T16:05:00Z"));
+      await usage.fetchAll();
+
+      expect(usage.lastUpdatedAt).toBe(previousUpdatedAt);
+      expect(usage.hasNewData).toBe(true);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts summary and top sessions together during full refresh", async () => {
     const calls: string[] = [];
     let resolveSummary:
       | ((value: unknown) => void)
@@ -318,7 +370,7 @@ describe("UsageStore session filter params", () => {
     const fetch = usage.fetchAll();
     await Promise.resolve();
 
-    expect(calls).toEqual(["summary"]);
+    expect(calls).toEqual(["summary", "topSessions"]);
     expect(usage.summary).toBeNull();
 
     resolveSummary?.({

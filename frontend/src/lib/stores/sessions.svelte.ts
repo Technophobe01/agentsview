@@ -3,7 +3,10 @@ import {
   MetadataService,
   SessionsService,
 } from "../api/generated/index";
-import { configureGeneratedClient } from "../api/runtime.js";
+import {
+  callGenerated,
+  configureGeneratedClient,
+} from "../api/runtime.js";
 import type {
   Session,
   ProjectInfo,
@@ -13,9 +16,10 @@ import type {
 } from "../api/types.js";
 import { sync } from "./sync.svelte.js";
 import { events } from "./events.svelte.js";
+import { starred } from "./starred.svelte.js";
 
-type SessionListParams = Parameters<
-  typeof SessionsService.getApiV1Sessions
+type SidebarIndexParams = Parameters<
+  typeof SessionsService.getApiV1SessionsSidebarIndex
 >[0];
 type MetadataParams = Parameters<
   typeof MetadataService.getApiV1Projects
@@ -252,6 +256,10 @@ class SessionsStore {
   private sidebarHydrationEpochByVersion = new Map<number, number>();
   private sidebarHydrationQueue: Array<() => void> = [];
   private sidebarHydrationActive = 0;
+  private sidebarConsumers = 0;
+  private sidebarLoadPromise: Promise<void> | null = null;
+  private sidebarLoadSignature: string | null = null;
+  private sidebarAbort: AbortController | null = null;
 
   private liveRefreshStarted = false;
   private unsubEvents: (() => void) | null = null;
@@ -267,7 +275,7 @@ class SessionsStore {
     return buildSessionGroups(this.sessions);
   }
 
-  private get apiParams(): SessionListParams {
+  private get apiParams(): SidebarIndexParams {
     const f = this.filters;
     // Don't exclude "unknown" when explicitly viewing it.
     const exclude =
@@ -296,6 +304,7 @@ class SessionsStore {
         f.minUserMessages > 0 ? f.minUserMessages : undefined,
       includeOneShot: f.includeOneShot || undefined,
       includeAutomated: f.includeAutomated || undefined,
+      starred: starred.filterOnly || undefined,
     };
   }
 
@@ -303,6 +312,20 @@ class SessionsStore {
     this.sessions = [];
     this.nextCursor = null;
     this.total = 0;
+  }
+
+  attachSidebar(): () => void {
+    this.sidebarConsumers++;
+    this.startLiveRefresh();
+    let detached = false;
+    return () => {
+      if (detached) return;
+      detached = true;
+      this.sidebarConsumers = Math.max(0, this.sidebarConsumers - 1);
+      if (this.sidebarConsumers === 0) {
+        this.dispose();
+      }
+    };
   }
 
   initFromParams(params: Record<string, string>) {
@@ -319,7 +342,47 @@ class SessionsStore {
 
   async load() {
     saveFilters(this.filters);
-    this.startLiveRefresh();
+
+    const params = {
+      ...this.apiParams,
+      limit: SESSION_PAGE_SIZE,
+    };
+    const signature = JSON.stringify(params);
+    if (
+      this.sidebarLoadPromise !== null &&
+      this.sidebarLoadSignature === signature
+    ) {
+      return this.sidebarLoadPromise;
+    }
+
+    this.sidebarAbort?.abort();
+    const controller = new AbortController();
+    this.sidebarAbort = controller;
+    const promise = this.loadSidebarPage(params, controller.signal);
+    this.sidebarLoadPromise = promise;
+    this.sidebarLoadSignature = signature;
+    try {
+      await promise;
+    } finally {
+      if (this.sidebarLoadPromise === promise) {
+        this.sidebarLoadPromise = null;
+        this.sidebarLoadSignature = null;
+        if (this.sidebarAbort === controller) {
+          this.sidebarAbort = null;
+        }
+      }
+    }
+  }
+
+  refreshSidebarIfAttached() {
+    if (this.sidebarConsumers === 0) return;
+    void this.load();
+  }
+
+  private async loadSidebarPage(
+    params: SidebarIndexParams,
+    signal: AbortSignal,
+  ) {
     const version = ++this.loadVersion;
     const indexVersion = this.sidebarIndexVersion + 1;
     // Keep the existing list visible during reloads, but mark
@@ -335,9 +398,9 @@ class SessionsStore {
       total: this.total,
     };
     try {
-      configureGeneratedClient();
-      const index = await SessionsService.getApiV1SessionsSidebarIndex(
-        this.apiParams,
+      const index = await callGenerated(
+        () => SessionsService.getApiV1SessionsSidebarIndex(params),
+        signal,
       ) as unknown as SidebarSessionIndexResponse;
       if (this.loadVersion !== version) return;
 
@@ -345,11 +408,14 @@ class SessionsStore {
       this.hydratedSessionsByVersion.set(indexVersion, new Map());
       this.sidebarHydrationEpochByVersion.set(indexVersion, 0);
       this.pruneSidebarHydrationVersions(indexVersion);
-      const previousById = new Map(prev.sessions.map((s) => [s.id, s]));
+      const existing = new Map(this.sessions.map((session) => [
+        session.id,
+        session,
+      ]));
       this.sessions = index.sessions.map((row) =>
-        sidebarIndexRowToSession(row, previousById.get(row.id))
+        sidebarIndexRowToSession(row, existing.get(row.id))
       );
-      this.nextCursor = null;
+      this.nextCursor = index.next_cursor ?? null;
       this.total = index.total;
     } catch {
       // Restore previous state so a transient failure
@@ -479,19 +545,21 @@ class SessionsStore {
     this.loading = true;
     try {
       configureGeneratedClient();
-      const page = await SessionsService.getApiV1Sessions({
+      const index = await SessionsService.getApiV1SessionsSidebarIndex({
         ...this.apiParams,
         cursor: this.nextCursor,
         limit: SESSION_PAGE_SIZE,
-      }) as unknown as {
-        sessions: Session[];
-        next_cursor?: string | null;
-        total: number;
-      };
+      }) as unknown as SidebarSessionIndexResponse;
       if (this.loadVersion !== version) return;
-      this.sessions.push(...page.sessions);
-      this.nextCursor = page.next_cursor ?? null;
-      this.total = page.total;
+      this.sessions.push(
+        ...index.sessions.map((row) =>
+          sidebarIndexRowToSession(row, this.sessions.find(
+            (existing) => existing.id === row.id,
+          ))
+        ),
+      );
+      this.nextCursor = index.next_cursor ?? null;
+      this.total = index.total;
     } finally {
       if (this.loadVersion === version) {
         this.loading = false;
@@ -1071,6 +1139,7 @@ class SessionsStore {
   }
 
   private scheduleIndexRefresh() {
+    if (this.sidebarConsumers === 0) return;
     if (this.liveRefreshTimer !== null) {
       clearTimeout(this.liveRefreshTimer);
     }
@@ -1093,6 +1162,11 @@ class SessionsStore {
       clearInterval(this.safetyNetTimer);
       this.safetyNetTimer = null;
     }
+    this.sidebarAbort?.abort();
+    this.sidebarAbort = null;
+    this.sidebarLoadPromise = null;
+    this.sidebarLoadSignature = null;
+    this.loadVersion++;
     this.liveRefreshStarted = false;
   }
 }
@@ -1548,5 +1622,5 @@ export const sessions = createSessionsStore();
 // (local trigger or detected via status polling).
 sync.onSyncComplete(() => {
   sessions.invalidateFilterCaches();
-  sessions.load();
+  sessions.refreshSidebarIfAttached();
 });

@@ -2943,6 +2943,40 @@ func TestPath(t *testing.T) {
 	assert.Equal(t, path, d.Path(), "Path()")
 }
 
+func TestOpenConfiguresWALJournalSizeLimit(t *testing.T) {
+	d := testDB(t)
+
+	var got int64
+	err := d.getWriter().QueryRow("PRAGMA journal_size_limit").Scan(&got)
+	requireNoError(t, err, "PRAGMA journal_size_limit")
+	assert.Equal(t, int64(walJournalSizeLimitBytes), got)
+}
+
+func TestCheckpointWALTruncate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	d, err := Open(path)
+	requireNoError(t, err, "Open")
+	defer d.Close()
+
+	_, err = d.getWriter().Exec(`PRAGMA wal_autocheckpoint=0`)
+	requireNoError(t, err, "disable wal autocheckpoint")
+
+	for i := range 100 {
+		insertSession(t, d, fmt.Sprintf("wal-session-%03d", i), "proj")
+	}
+	require.FileExists(t, path+"-wal")
+
+	err = d.CheckpointWALTruncateWithRetry(context.Background())
+	requireNoError(t, err, "CheckpointWALTruncateWithRetry")
+
+	if info, err := os.Stat(path + "-wal"); err == nil {
+		assert.LessOrEqual(t, info.Size(), int64(walJournalSizeLimitBytes))
+	} else {
+		require.True(t, os.IsNotExist(err), "stat wal: %v", err)
+	}
+}
+
 func TestReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
@@ -5301,19 +5335,27 @@ func TestSessionsTerminationStatusIndex(t *testing.T) {
 		count)
 }
 
-func TestMessagesUsageTimestampIndex(t *testing.T) {
+func TestMessagesUsageCoveringIndex(t *testing.T) {
 	d := testDB(t)
 
 	var count int
 	err := d.getReader().QueryRow(
 		`SELECT count(*) FROM sqlite_master
-		 WHERE type = 'index' AND name = 'idx_messages_usage_timestamp'`,
+		 WHERE type = 'index' AND name = 'idx_messages_usage_covering'`,
 	).Scan(&count)
-	requireNoError(t, err, "probing idx_messages_usage_timestamp")
+	requireNoError(t, err, "probing idx_messages_usage_covering")
 
 	require.Equal(t, 1, count,
-		"expected idx_messages_usage_timestamp to exist, got count=%d",
+		"expected idx_messages_usage_covering to exist, got count=%d",
 		count)
+
+	err = d.getReader().QueryRow(
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type = 'index' AND name = 'idx_messages_usage_timestamp'`,
+	).Scan(&count)
+	requireNoError(t, err, "probing legacy idx_messages_usage_timestamp")
+	require.Equal(t, 0, count,
+		"expected idx_messages_usage_timestamp to be dropped")
 }
 
 // TestMigration_TerminationStatusColumn simulates upgrading from a

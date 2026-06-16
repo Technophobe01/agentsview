@@ -299,6 +299,7 @@ type SessionFilter struct {
 	HealthGrade      []string // filter by health grade values
 	MinToolFailures  *int     // minimum tool_failure_signal_count
 	HasSecret        bool     // only sessions with current secret_leak_count > 0
+	Starred          bool     // only sessions starred by the user
 	// SecretsRulesVersions limits HasSecret to sessions scanned by one of these
 	// current scanner versions. Empty preserves raw DB semantics for tests and
 	// direct store callers that explicitly want unversioned counts.
@@ -326,6 +327,30 @@ const staleWindow = 60 * time.Minute
 // filters when classifying by status.
 const activityExprSQLite = "CAST(strftime('%s', " +
 	"COALESCE(ended_at, started_at, created_at)) AS INTEGER)"
+
+const sidebarActivityExprSQLiteS = "COALESCE(" +
+	"NULLIF(s.ended_at, ''), NULLIF(s.started_at, ''), s.created_at)"
+
+const sidebarChildRelationshipsSQL = "'subagent', 'fork', 'continuation'"
+
+func sidebarStarredRootCTE(enabled bool) string {
+	if !enabled {
+		return ""
+	}
+	return `,
+		eligible_roots(id) AS (
+			SELECT DISTINCT t.root_id
+			FROM tree t
+			JOIN starred_sessions ss ON ss.session_id = t.id
+		)`
+}
+
+func sidebarStarredRootJoin(enabled bool) string {
+	if !enabled {
+		return ""
+	}
+	return "JOIN eligible_roots e ON e.id = t.root_id"
+}
 
 // buildTerminationPredSQLite returns a WHERE fragment and args for
 // the multi-state termination filter (active / stale / unclean).
@@ -372,8 +397,9 @@ type SidebarSessionIndexRow struct {
 }
 
 type SidebarSessionIndex struct {
-	Sessions []SidebarSessionIndexRow `json:"sessions"`
-	Total    int                      `json:"total"`
+	Sessions   []SidebarSessionIndexRow `json:"sessions"`
+	NextCursor string                   `json:"next_cursor,omitempty"`
+	Total      int                      `json:"total"`
 }
 
 // buildSessionFilter returns a WHERE clause and args for the
@@ -464,14 +490,18 @@ func (db *DB) ListSessions(
 }
 
 // GetSidebarSessionIndex returns the skinny session rows needed by
-// the sidebar grouper. It intentionally has no cursor or limit.
+// the sidebar grouper. Paginated calls page root sessions and include
+// each root's descendants so grouped sidebar trees stay complete.
 func (db *DB) GetSidebarSessionIndex(
 	ctx context.Context, f SessionFilter,
 ) (SidebarSessionIndex, error) {
 	f.IncludeChildren = true
-	f.Cursor = ""
-	f.Limit = 0
 
+	if f.Limit > 0 || f.Cursor != "" || f.Starred {
+		return db.getSidebarSessionIndexPage(ctx, f)
+	}
+
+	f.Cursor = ""
 	where, args := buildSessionFilter(f)
 	query := `
 		SELECT
@@ -537,6 +567,248 @@ func (db *DB) GetSidebarSessionIndex(
 			fmt.Errorf("iterating sidebar session index: %w", err)
 	}
 	index.Total = len(index.Sessions)
+
+	return index, nil
+}
+
+func (db *DB) getSidebarSessionIndexPage(
+	ctx context.Context, f SessionFilter,
+) (SidebarSessionIndex, error) {
+	if f.Limit <= 0 || f.Limit > MaxSessionLimit {
+		f.Limit = DefaultSessionLimit
+	}
+
+	rootFilter := f
+	rootFilter.IncludeChildren = false
+	rootFilter.Cursor = ""
+	rootFilter.Starred = false
+	rootWhere, rootArgs := buildSessionFilter(rootFilter)
+	canonicalRootWhere := `
+		NOT EXISTS (
+			SELECT 1
+			FROM sessions parent
+			WHERE parent.id = sessions.parent_session_id
+			  AND parent.deleted_at IS NULL
+			  AND sessions.relationship_type IN (` + sidebarChildRelationshipsSQL + `)
+		)`
+
+	var total int
+	var cur SessionCursor
+	if f.Cursor != "" {
+		var err error
+		cur, err = db.DecodeCursor(f.Cursor)
+		if err != nil {
+			return SidebarSessionIndex{}, err
+		}
+		total = cur.Total
+	}
+	if total <= 0 {
+		if f.Starred {
+			countQuery := `
+				WITH RECURSIVE root_candidates(id) AS (
+					SELECT id
+					FROM sessions
+					WHERE ` + rootWhere + `
+					  AND ` + canonicalRootWhere + `
+				),
+				tree(root_id, id) AS (
+					SELECT id, id FROM root_candidates
+					UNION
+					SELECT t.root_id, s.id
+					FROM sessions s
+					JOIN tree t ON s.parent_session_id = t.id
+					WHERE s.message_count > 0
+					  AND s.deleted_at IS NULL
+				),
+				eligible_roots(id) AS (
+					SELECT DISTINCT t.root_id
+					FROM tree t
+					JOIN starred_sessions ss ON ss.session_id = t.id
+				)
+				SELECT COUNT(*) FROM eligible_roots`
+			if err := db.getReader().QueryRowContext(
+				ctx, countQuery, rootArgs...,
+			).Scan(&total); err != nil {
+				return SidebarSessionIndex{},
+					fmt.Errorf("counting sidebar roots: %w", err)
+			}
+		} else {
+			countQuery := "SELECT COUNT(*) FROM sessions WHERE " +
+				rootWhere + " AND " + canonicalRootWhere
+			if err := db.getReader().QueryRowContext(
+				ctx, countQuery, rootArgs...,
+			).Scan(&total); err != nil {
+				return SidebarSessionIndex{},
+					fmt.Errorf("counting sidebar roots: %w", err)
+			}
+		}
+	}
+
+	pageBuilder := NewQueryBuilder(SQLiteQueryDialect(), len(rootArgs))
+	cursorWhere := ""
+	if f.Cursor != "" {
+		cursorWhere = "WHERE (activity, id) < (" +
+			pageBuilder.Add(cur.EndedAt) + ", " +
+			pageBuilder.Add(cur.ID) + ")"
+	}
+	rootQuery := `
+		WITH RECURSIVE root_candidates(id) AS (
+			SELECT id
+			FROM sessions
+			WHERE ` + rootWhere + `
+			  AND ` + canonicalRootWhere + `
+		),
+		tree(root_id, id) AS (
+			SELECT id, id FROM root_candidates
+			UNION
+			SELECT t.root_id, s.id
+			FROM sessions s
+			JOIN tree t ON s.parent_session_id = t.id
+			WHERE s.message_count > 0
+			  AND s.deleted_at IS NULL
+		)
+		` + sidebarStarredRootCTE(f.Starred) + `,
+		root_activity(id, activity) AS (
+			SELECT t.root_id AS id, MAX(` + sidebarActivityExprSQLiteS + `) AS activity
+			FROM tree t
+			` + sidebarStarredRootJoin(f.Starred) + `
+			JOIN sessions s ON s.id = t.id
+			GROUP BY t.root_id
+		)
+		SELECT id, activity
+		FROM root_activity
+		` + cursorWhere + `
+		ORDER BY activity DESC, id DESC
+		` + pageBuilder.Limit(f.Limit+1)
+	rootQueryArgs := append([]any{}, rootArgs...)
+	rootQueryArgs = append(rootQueryArgs, pageBuilder.Args()...)
+
+	rows, err := db.getReader().QueryContext(ctx, rootQuery, rootQueryArgs...)
+	if err != nil {
+		return SidebarSessionIndex{},
+			fmt.Errorf("querying sidebar root page: %w", err)
+	}
+	defer rows.Close()
+
+	type rootRow struct {
+		id       string
+		activity string
+	}
+	roots := []rootRow{}
+	for rows.Next() {
+		var row rootRow
+		if err := rows.Scan(&row.id, &row.activity); err != nil {
+			return SidebarSessionIndex{},
+				fmt.Errorf("scanning sidebar root page: %w", err)
+		}
+		roots = append(roots, row)
+	}
+	if err := rows.Err(); err != nil {
+		return SidebarSessionIndex{},
+			fmt.Errorf("iterating sidebar root page: %w", err)
+	}
+
+	index := SidebarSessionIndex{
+		Sessions: []SidebarSessionIndexRow{},
+		Total:    total,
+	}
+	if len(roots) == 0 {
+		return index, nil
+	}
+	selected := roots
+	if len(roots) > f.Limit {
+		selected = roots[:f.Limit]
+		last := selected[f.Limit-1]
+		index.NextCursor = db.EncodeCursor(last.activity, last.id, total)
+	}
+
+	cteParts := make([]string, 0, len(selected))
+	treeArgs := make([]any, 0, len(selected)*2)
+	for i, root := range selected {
+		if i == 0 {
+			cteParts = append(cteParts, "SELECT ? AS id, ? AS ord")
+		} else {
+			cteParts = append(cteParts, "UNION ALL SELECT ?, ?")
+		}
+		treeArgs = append(treeArgs, root.id, i)
+	}
+
+	treeQuery := `
+		WITH RECURSIVE root_page(id, ord) AS (
+			` + strings.Join(cteParts, "\n") + `
+		),
+		tree(id, ord) AS (
+			SELECT id, ord FROM root_page
+			UNION
+			SELECT s.id, t.ord
+			FROM sessions s
+			JOIN tree t ON s.parent_session_id = t.id
+			WHERE s.message_count > 0
+			  AND s.deleted_at IS NULL
+		),
+		ranked_tree(id, ord) AS (
+			SELECT id, MIN(ord) AS ord
+			FROM tree
+			GROUP BY id
+		)
+		SELECT
+			s.id,
+			s.parent_session_id,
+			s.relationship_type,
+			s.project,
+			s.machine,
+			s.agent,
+			COALESCE(s.display_name, s.session_name) AS display_name,
+			s.started_at,
+			s.ended_at,
+			s.created_at,
+			s.termination_status,
+			s.message_count,
+			s.user_message_count,
+			s.is_automated,
+			INSTR(COALESCE(s.first_message, ''), '<teammate-message') > 0
+		FROM sessions s
+		JOIN ranked_tree t ON s.id = t.id
+		ORDER BY
+			t.ord ASC,
+			` + sidebarActivityExprSQLiteS + ` DESC,
+			s.id DESC`
+
+	rows, err = db.getReader().QueryContext(ctx, treeQuery, treeArgs...)
+	if err != nil {
+		return SidebarSessionIndex{},
+			fmt.Errorf("querying sidebar tree page: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var row SidebarSessionIndexRow
+		if err := rows.Scan(
+			&row.ID,
+			&row.ParentSessionID,
+			&row.RelationshipType,
+			&row.Project,
+			&row.Machine,
+			&row.Agent,
+			&row.DisplayName,
+			&row.StartedAt,
+			&row.EndedAt,
+			&row.CreatedAt,
+			&row.TerminationStatus,
+			&row.MessageCount,
+			&row.UserMessageCount,
+			&row.IsAutomated,
+			&row.IsTeammate,
+		); err != nil {
+			return SidebarSessionIndex{},
+				fmt.Errorf("scanning sidebar tree page: %w", err)
+		}
+		index.Sessions = append(index.Sessions, row)
+	}
+	if err := rows.Err(); err != nil {
+		return SidebarSessionIndex{},
+			fmt.Errorf("iterating sidebar tree page: %w", err)
+	}
 
 	return index, nil
 }
