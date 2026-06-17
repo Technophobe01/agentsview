@@ -20,6 +20,10 @@
   import { events } from "../../stores/events.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { exportAnalyticsCSV } from "../../utils/csv-export.js";
+  import {
+    createRefreshScheduler,
+    formatRefreshAge,
+  } from "../../utils/refresh.js";
   import { RefreshCwIcon } from "../../icons.js";
 
   function shortTz(tz: string): string {
@@ -30,13 +34,7 @@
   }
 
   const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
-
-  function formatUpdatedAt(value: number): string {
-    return new Date(value).toLocaleTimeString([], {
-      hour: "numeric",
-      minute: "2-digit",
-    });
-  }
+  const REFRESH_LABEL_INTERVAL_MS = 60 * 1000;
 
   function handleExportCSV() {
     exportAnalyticsCSV({
@@ -50,15 +48,33 @@
     });
   }
 
-  let refreshTimer: ReturnType<typeof setInterval> | undefined;
+  const refreshScheduler = createRefreshScheduler(
+    () => analytics.fetchAll(),
+    REFRESH_INTERVAL_MS,
+  );
+  let refreshLabelTick = $state(Date.now());
+  let refreshLabelTimer:
+    | ReturnType<typeof setTimeout>
+    | undefined;
   let unsubEvents: (() => void) | undefined;
 
-  onMount(() => {
-    analytics.fetchAll();
-    refreshTimer = setInterval(
-      () => analytics.fetchAll(),
-      REFRESH_INTERVAL_MS,
+  let refreshLabel = $derived.by(() => {
+    return formatRefreshAge(
+      analytics.lastUpdatedAt,
+      refreshLabelTick,
     );
+  });
+
+  function scheduleRefreshLabelTick() {
+    refreshLabelTimer = setTimeout(() => {
+      refreshLabelTick = Date.now();
+      scheduleRefreshLabelTick();
+    }, REFRESH_LABEL_INTERVAL_MS);
+  }
+
+  onMount(() => {
+    refreshScheduler.start();
+    scheduleRefreshLabelTick();
     unsubEvents = events.subscribe(() => analytics.markNewData());
   });
 
@@ -142,8 +158,9 @@
   });
 
   onDestroy(() => {
-    if (refreshTimer !== undefined) {
-      clearInterval(refreshTimer);
+    refreshScheduler.stop();
+    if (refreshLabelTimer !== undefined) {
+      clearTimeout(refreshLabelTimer);
     }
     unsubEvents?.();
   });
@@ -168,27 +185,26 @@
       onChange={(from, to) => analytics.setDateRange(from, to)}
       onPreset={(days) => analytics.setRollingWindow(days)}
     />
-    <button
-      class="refresh-btn"
-      class:querying={analytics.isQuerying}
-      onclick={() => analytics.fetchAll()}
-      disabled={analytics.isQuerying}
-      title="Refresh analytics"
-      aria-label="Refresh analytics"
-    >
-      <RefreshCwIcon size="14" strokeWidth="2" aria-hidden="true" />
-    </button>
-    <div class="refresh-status" aria-live="polite">
-      {#if analytics.lastUpdatedAt !== null}
-        <span title={new Date(analytics.lastUpdatedAt).toLocaleString()}>
-          Updated {formatUpdatedAt(analytics.lastUpdatedAt)}
+    <div class="refresh-control">
+      <button
+        class="refresh-btn"
+        class:querying={analytics.isQuerying}
+        onclick={() => refreshScheduler.refreshNow()}
+        disabled={analytics.isQuerying}
+        title="Refresh analytics"
+        aria-label="Refresh analytics"
+      >
+        <RefreshCwIcon size="14" strokeWidth="2" aria-hidden="true" />
+      </button>
+      <div class="refresh-status">
+        <span
+          title={analytics.lastUpdatedAt === null
+            ? undefined
+            : new Date(analytics.lastUpdatedAt).toLocaleString()}
+        >
+          {refreshLabel}
         </span>
-      {:else}
-        <span>Not updated</span>
-      {/if}
-      {#if analytics.hasNewData}
-        <span class="new-data">New data</span>
-      {/if}
+      </div>
     </div>
     <button class="export-btn" onclick={handleExportCSV}>
       Export CSV
@@ -284,6 +300,13 @@
     align-items: center;
   }
 
+  .refresh-control {
+    min-height: 28px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
   .refresh-btn {
     width: 28px;
     height: 28px;
@@ -320,17 +343,6 @@
     white-space: nowrap;
   }
 
-  .new-data {
-    display: inline-flex;
-    align-items: center;
-    min-height: 18px;
-    padding: 0 6px;
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface-hover);
-    color: var(--accent-blue);
-    font-weight: 600;
-  }
-
   .export-btn {
     height: 24px;
     padding: 0 8px;
@@ -364,11 +376,12 @@
   }
 
   .query-progress {
-    position: sticky;
+    position: absolute;
     top: 0;
+    left: 0;
+    right: 0;
     z-index: 4;
     height: 2px;
-    margin: -16px -16px 14px;
     overflow: hidden;
     background: color-mix(
       in srgb,

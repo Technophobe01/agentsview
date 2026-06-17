@@ -23,16 +23,27 @@
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
   import SessionActiveFilters from "../filters/SessionActiveFilters.svelte";
   import FilterDropdown from "./FilterDropdown.svelte";
+  import { formatRefreshAge } from "../../utils/refresh.js";
   import { RefreshCwIcon } from "../../icons.js";
 
+  const REFRESH_LABEL_INTERVAL_MS = 60 * 1000;
+
   let mounted = false;
+  let refreshLabelTick = $state(Date.now());
+  let refreshLabelTimer:
+    | ReturnType<typeof setTimeout>
+    | undefined;
   let unsubEvents: (() => void) | undefined;
 
-  function formatUpdatedAt(value: number): string {
-    return new Date(value).toLocaleTimeString([], {
-      hour: "numeric",
-      minute: "2-digit",
-    });
+  let refreshLabel = $derived.by(() => {
+    return formatRefreshAge(usage.lastUpdatedAt, refreshLabelTick);
+  });
+
+  function scheduleRefreshLabelTick() {
+    refreshLabelTimer = setTimeout(() => {
+      refreshLabelTick = Date.now();
+      scheduleRefreshLabelTick();
+    }, REFRESH_LABEL_INTERVAL_MS);
   }
 
   const projectItems = $derived(
@@ -244,12 +255,16 @@
   onMount(() => {
     mounted = true;
     unsubEvents = events.subscribe(() => usage.markNewData());
+    scheduleRefreshLabelTick();
     tick().then(() => {
       urlWritebackReady = true;
     });
   });
 
   onDestroy(() => {
+    if (refreshLabelTimer !== undefined) {
+      clearTimeout(refreshLabelTimer);
+    }
     unsubEvents?.();
   });
 </script>
@@ -299,27 +314,26 @@
           usage.deselectAllModels(modelItems.map((m) => m.name))}
       />
 
-      <button
-        class="refresh-btn"
-        class:querying={usage.isQuerying}
-        onclick={() => usage.fetchAll()}
-        disabled={usage.isQuerying}
-        title="Refresh"
-        aria-label="Refresh usage data"
-      >
-        <RefreshCwIcon size="14" strokeWidth="2" aria-hidden="true" />
-      </button>
-      <div class="refresh-status" aria-live="polite">
-        {#if usage.lastUpdatedAt !== null}
-          <span title={new Date(usage.lastUpdatedAt).toLocaleString()}>
-            Updated {formatUpdatedAt(usage.lastUpdatedAt)}
+      <div class="refresh-control">
+        <button
+          class="refresh-btn"
+          class:querying={usage.isQuerying}
+          onclick={() => usage.fetchAll()}
+          disabled={usage.isQuerying}
+          title="Refresh"
+          aria-label="Refresh usage data"
+        >
+          <RefreshCwIcon size="14" strokeWidth="2" aria-hidden="true" />
+        </button>
+        <div class="refresh-status">
+          <span
+            title={usage.lastUpdatedAt === null
+              ? undefined
+              : new Date(usage.lastUpdatedAt).toLocaleString()}
+          >
+            {refreshLabel}
           </span>
-        {:else}
-          <span>Not updated</span>
-        {/if}
-        {#if usage.hasNewData}
-          <span class="new-data">New data</span>
-        {/if}
+        </div>
       </div>
 
     </div>
@@ -394,6 +408,13 @@
     align-items: center;
   }
 
+  .refresh-control {
+    min-height: 28px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
   .refresh-btn {
     width: 28px;
     height: 28px;
@@ -430,17 +451,6 @@
     white-space: nowrap;
   }
 
-  .new-data {
-    display: inline-flex;
-    align-items: center;
-    min-height: 18px;
-    padding: 0 6px;
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface-hover);
-    color: var(--accent-blue);
-    font-weight: 600;
-  }
-
   .usage-content {
     flex: 1;
     overflow-y: auto;
@@ -457,11 +467,12 @@
   }
 
   .query-progress {
-    position: sticky;
+    position: absolute;
     top: 0;
+    left: 0;
+    right: 0;
     z-index: 4;
     height: 2px;
-    margin: -16px -16px 14px;
     overflow: hidden;
     background: color-mix(
       in srgb,
