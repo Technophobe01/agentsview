@@ -1,6 +1,7 @@
 export { default as ActivityIcon } from "@lucide/svelte/icons/activity";
 export { default as ArrowDownIcon } from "@lucide/svelte/icons/arrow-down";
 export { default as ArrowDownWideNarrowIcon } from "@lucide/svelte/icons/arrow-down-wide-narrow";
+export { default as ArrowUpIcon } from "@lucide/svelte/icons/arrow-up";
 export { default as ArrowUpNarrowWideIcon } from "@lucide/svelte/icons/arrow-up-narrow-wide";
 export { default as CalendarIcon } from "@lucide/svelte/icons/calendar";
 export { default as CheckIcon } from "@lucide/svelte/icons/check";
@@ -10,6 +11,7 @@ export { default as ChevronLeftIcon } from "@lucide/svelte/icons/chevron-left";
 export { default as ChevronRightIcon } from "@lucide/svelte/icons/chevron-right";
 export { default as ChevronUpIcon } from "@lucide/svelte/icons/chevron-up";
 export { default as CirclePlayIcon } from "@lucide/svelte/icons/circle-play";
+export { default as CircleQuestionMarkIcon } from "@lucide/svelte/icons/circle-question-mark";
 export { default as ClockIcon } from "@lucide/svelte/icons/clock";
 export { default as CodeIcon } from "@lucide/svelte/icons/code";
 export { default as CloudUploadIcon } from "@lucide/svelte/icons/cloud-upload";

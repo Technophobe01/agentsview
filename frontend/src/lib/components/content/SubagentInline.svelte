@@ -13,6 +13,10 @@
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import MessageContent from "./MessageContent.svelte";
+  import {
+    ChevronRightIcon,
+    ExternalLinkIcon,
+  } from "../../icons.js";
 
   interface Props {
     sessionId: string;
@@ -97,7 +101,9 @@
 <div class="subagent-inline">
   <div class="subagent-header">
     <button class="subagent-toggle" onclick={toggleExpand}>
-      <span class="toggle-chevron" class:open={expanded}>&#9656;</span>
+      <span class="toggle-chevron" class:open={expanded}>
+        <ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" />
+      </span>
       <span class="toggle-label">Subagent session</span>
       {#if agentLabel}
         <span class="toggle-meta">{agentLabel}</span>
@@ -121,7 +127,8 @@
       onclick={openAsSession}
       title="Open as full session"
     >
-      Open session &#8599;
+      Open session
+      <ExternalLinkIcon size="10" strokeWidth="2.2" aria-hidden="true" />
     </a>
   </div>
 
@@ -172,8 +179,8 @@
   }
 
   .toggle-chevron {
-    display: inline-block;
-    font-size: 10px;
+    display: inline-flex;
+    align-items: center;
     transition: transform 0.15s;
     flex-shrink: 0;
   }
@@ -208,6 +215,9 @@
   }
 
   .open-session-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     font-size: 10px;
     color: var(--text-secondary);
     padding: 6px 10px;
