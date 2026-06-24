@@ -103,6 +103,9 @@ describe("MessageContent", () => {
     expect(document.querySelector(".role-label")?.textContent?.trim()).toBe(
       "用户",
     );
+    expect(document.querySelector(".role-icon")?.getAttribute("style")).toContain(
+      "var(--accent-blue-foreground)",
+    );
     const copyButton = document.querySelector<HTMLButtonElement>(
       "button.copy-btn",
     );
@@ -135,6 +138,23 @@ describe("MessageContent", () => {
     const tokenMeta = document.querySelector(".message-tokens");
     expect(tokenMeta?.textContent?.replace(/\s+/g, " ").trim()).toBe(
       "2.4k ctx / 180 out",
+    );
+
+    unmount(component);
+  });
+
+  it("uses the assistant accent foreground for assistant role icons", async () => {
+    const component = mount(MessageContent, {
+      target: document.body,
+      props: {
+        message: makeMessage({ role: "assistant" }),
+      },
+    });
+
+    await tick();
+
+    expect(document.querySelector(".role-icon")?.getAttribute("style")).toContain(
+      "var(--accent-purple-foreground)",
     );
 
     unmount(component);

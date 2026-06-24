@@ -256,7 +256,7 @@
 
   .toggle-btn.active {
     background: var(--accent-green, #22c55e);
-    color: white;
+    color: var(--accent-green-foreground);
     border-color: transparent;
   }
 
@@ -372,12 +372,12 @@
   }
 
   .connect-btn {
-    color: white;
+    color: var(--accent-blue-foreground);
     background: var(--accent-blue);
   }
 
   .disconnect-btn {
-    color: white;
+    color: var(--accent-red-foreground);
     background: var(--accent-red, #ef4444);
   }
 
