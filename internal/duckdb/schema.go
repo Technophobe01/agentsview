@@ -352,7 +352,8 @@ var mirrorTables = []tableSpec{
 			skill_name TEXT,
 			result_content_length INTEGER,
 			result_content TEXT,
-			subagent_session_id TEXT
+			subagent_session_id TEXT,
+			file_path TEXT
 		)`,
 		columns: []columnSpec{
 			{"id", "id BIGINT"},
@@ -367,12 +368,17 @@ var mirrorTables = []tableSpec{
 			{"result_content_length", "result_content_length INTEGER"},
 			{"result_content", "result_content TEXT"},
 			{"subagent_session_id", "subagent_session_id TEXT"},
+			{"file_path", "file_path TEXT"},
 		},
 		indexes: []string{
 			"CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_dedup ON tool_calls(session_id, message_id, call_index)",
 			"CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id)",
 			"CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)",
 			"CREATE INDEX IF NOT EXISTS idx_tool_calls_category ON tool_calls(category)",
+			// DuckDB has no partial indexes, so this mirrors SQLite's
+			// idx_tool_calls_file_path without the WHERE file_path IS NOT NULL
+			// clause; it backs the cross-session Recent Edits feed.
+			"CREATE INDEX IF NOT EXISTS idx_tool_calls_file_path ON tool_calls(file_path)",
 		},
 	},
 	{

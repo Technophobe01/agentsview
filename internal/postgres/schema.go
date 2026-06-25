@@ -199,6 +199,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     result_content        TEXT,
     subagent_session_id   TEXT,
     message_ordinal       INT NOT NULL,
+    file_path             TEXT,
     FOREIGN KEY (session_id)
         REFERENCES sessions(id) ON DELETE CASCADE
 );
@@ -383,6 +384,11 @@ func EnsureSchema(
 			"tool_calls", "call_index",
 			`call_index INT NOT NULL DEFAULT 0`,
 			"adding tool_calls.call_index",
+		},
+		{
+			"tool_calls", "file_path",
+			`file_path TEXT`,
+			"adding tool_calls.file_path",
 		},
 		{
 			"sessions", "is_automated",
@@ -725,6 +731,11 @@ func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
 		   AND model != '<synthetic>'`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
+		// idx_tool_calls_file_path backs the cross-session Recent Edits feed.
+		// Created here, after the file_path column migration, mirroring the
+		// SQLite partial index so legacy schemas migrate cleanly.
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_file_path
+		 ON tool_calls(file_path) WHERE file_path IS NOT NULL`,
 	}
 	for _, ddl := range indexes {
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
@@ -1414,7 +1425,7 @@ func CheckSchemaCompat(
 	rows.Close()
 
 	rows, err = db.QueryContext(ctx,
-		`SELECT call_index FROM tool_calls LIMIT 0`)
+		`SELECT call_index, file_path FROM tool_calls LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"tool_calls table missing required columns: %w",
