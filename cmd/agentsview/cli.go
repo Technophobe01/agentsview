@@ -123,6 +123,7 @@ func newRootCommand() *cobra.Command {
 func newServeCommand() *cobra.Command {
 	var background bool
 	var checkDataVersion bool
+	var replace bool
 	cmd := &cobra.Command{
 		Use:          "serve",
 		Short:        "Start server",
@@ -141,10 +142,15 @@ func newServeCommand() *cobra.Command {
 				// Acquire the launch lock before loading config; config
 				// loading writes config.toml and must be single-writer
 				// across concurrent launches.
-				runServeBackgroundCommand(cmd)
+				runServeBackgroundCommand(
+					cmd, serveReplacementOptions{Replace: replace},
+				)
 				return nil
 			}
-			runServe(mustLoadConfig(cmd))
+			runServe(mustLoadConfig(cmd), serveOptions{
+				ReplaceDaemon:  replace,
+				NoSyncExplicit: cmd.Flags().Changed("no-sync"),
+			})
 			return nil
 		},
 	}
@@ -153,6 +159,12 @@ func newServeCommand() *cobra.Command {
 		"background",
 		false,
 		"Start server in the background and return to the shell",
+	)
+	cmd.Flags().BoolVar(
+		&replace,
+		"replace",
+		false,
+		"Replace a running local daemon before starting",
 	)
 	cmd.Flags().BoolVar(
 		&checkDataVersion,

@@ -85,7 +85,12 @@ func warnMissingDirs(dirs []string, label string) {
 	}
 }
 
-func runServe(cfg config.Config) {
+type serveOptions struct {
+	ReplaceDaemon  bool
+	NoSyncExplicit bool
+}
+
+func runServe(cfg config.Config, opts serveOptions) {
 	start := time.Now()
 	setupLogFile(cfg.DataDir)
 
@@ -108,6 +113,21 @@ func runServe(cfg config.Config) {
 			fmt.Printf("Auth enabled. Token: %s\n", cfg.AuthToken)
 		}
 	}
+
+	cont, releaseForegroundReplacement, err := prepareForegroundServeDaemon(
+		&cfg,
+		serveReplacementOptions{
+			Replace:        opts.ReplaceDaemon,
+			NoSyncExplicit: opts.NoSyncExplicit,
+		},
+	)
+	if err != nil {
+		fatal("%v", err)
+	}
+	if !cont {
+		return
+	}
+	defer releaseForegroundReplacement()
 
 	// Acquire the daemon start lock immediately after config setup,
 	// before opening the DB, so token-use never sees a window
@@ -264,6 +284,7 @@ func runServe(cfg config.Config) {
 		runtimeRecordDataDir = rt.Cfg.DataDir
 		UnmarkDaemonStarting(rt.Cfg.DataDir)
 	}
+	releaseForegroundReplacement()
 	if idleTracker != nil {
 		idleTracker.Touch()
 		go idleTracker.Run(ctx)
@@ -461,7 +482,9 @@ func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
 				"or run `agentsview serve stop` first",
 		)
 	}
-	if isBackgroundLaunchActive(dataDir) && !runningAsBackgroundChild() {
+	if isBackgroundLaunchActive(dataDir) &&
+		!ownsForegroundReplacementLaunchLock(dataDir) &&
+		!runningAsBackgroundChild() {
 		return fmt.Errorf(
 			"local daemon launch is in progress and owns the SQLite archive; " +
 				"refusing to write directly. Retry once it is ready " +
