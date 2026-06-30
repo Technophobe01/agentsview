@@ -55,6 +55,11 @@ rm -f "$OUTPUT"
     if [ -z "$trimmed" ]; then
       continue
     fi
+    # Skip comment lines so a terms file can document itself. Without this a
+    # bare '#' becomes the pattern '%#%', which matches almost every session.
+    case "$trimmed" in
+      '#'*) continue ;;
+    esac
 
     pattern="$(printf '%s' "$trimmed" | tr '[:upper:]' '[:lower:]')"
     pattern="${pattern//\\/\\\\}"
@@ -68,8 +73,16 @@ rm -f "$OUTPUT"
   done <<<"$BLOCKED_TERMS"
 } >"$BLOCKED_PATTERNS_SQL"
 
-# Copy the full database to preserve exact schema
-cp "$SOURCE" "$OUTPUT"
+# Snapshot the full database with VACUUM INTO. A plain cp of a
+# WAL-mode database reads a torn image and misses committed data still
+# in the -wal file, surfacing as "database disk image is malformed".
+# The online backup API (.backup) avoids that but restarts from
+# scratch every time a live `agentsview serve` writes through its own
+# connection, so it never converges against a busy daemon. VACUUM INTO
+# reads one snapshot-isolated pass that concurrent writes do not
+# restart, and does not touch the source. The target must not exist
+# (rm -f above guarantees that).
+sqlite3 "$SOURCE" "VACUUM INTO '$OUTPUT'"
 
 # Delete sessions (and related data) for non-matching projects.
 # The heredoc delimiter is quoted so bash does NOT expand $ or
@@ -117,7 +130,8 @@ WHERE s.project IN (SELECT name FROM screenshot_projects)
       COALESCE(s.display_name, '') || char(10) ||
       COALESCE(s.session_name, '') || char(10) ||
       COALESCE(s.cwd, '') || char(10) ||
-      COALESCE(s.file_path, '')
+      COALESCE(s.file_path, '') || char(10) ||
+      COALESCE(s.git_branch, '')
     ) LIKE p.pattern ESCAPE '\'
   )
   AND NOT EXISTS (
@@ -136,7 +150,9 @@ WHERE s.project IN (SELECT name FROM screenshot_projects)
     JOIN screenshot_blocked_patterns p
       ON lower(
         COALESCE(tc.input_json, '') || char(10) ||
-        COALESCE(tc.result_content, '')
+        COALESCE(tc.result_content, '') || char(10) ||
+        COALESCE(tc.file_path, '') || char(10) ||
+        COALESCE(tc.skill_name, '')
       ) LIKE p.pattern ESCAPE '\'
     WHERE tc.session_id = s.id
   )

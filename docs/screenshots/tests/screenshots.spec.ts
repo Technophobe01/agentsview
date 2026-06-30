@@ -273,6 +273,42 @@ test.describe('Dashboard', () => {
       }
     }
   });
+
+  test('dashboard model filter', async ({ page }) => {
+    // The dashboard toolbar Model dropdown reuses the shared
+    // FilterDropdown (label "Model") in include mode. Open it and
+    // include the first listed model so the screenshot shows the open
+    // panel, the resulting "Model: <name>" trigger label, and the
+    // active-filter chip the ActiveFilters row renders beneath it.
+    const trigger = page.locator(
+      '.analytics-toolbar .filter-dropdown .filter-trigger',
+      { hasText: 'Model' }
+    );
+    await expect(trigger).toBeVisible({ timeout: 5_000 });
+    await trigger.click();
+    await page.waitForSelector(
+      '.analytics-toolbar .filter-dropdown .dropdown-panel',
+      { timeout: 5_000 }
+    );
+
+    // In include mode the first .dropdown-row is the "All models"
+    // reset row; the actual models follow. Include the first real
+    // model if one exists so a filter chip appears.
+    const rows = page.locator(
+      '.analytics-toolbar .filter-dropdown .dropdown-row'
+    );
+    if (await rows.count() > 1) {
+      await rows.nth(1).click();
+      await page.waitForTimeout(1500);
+    }
+    await snap(page, 'analytics-model-filter');
+
+    // Clean up: clicking the "All models" row clears the filter.
+    if (await rows.count() > 0) {
+      await rows.first().click();
+    }
+    await page.keyboard.press('Escape');
+  });
 });
 
 // ── Activity dashboard ───────────────────────────────────
@@ -362,10 +398,14 @@ test.describe('Session browser', () => {
   });
 
   test('project filter', async ({ page }) => {
-    // Select a project from the dropdown
-    const select = page.locator('.project-select');
-    if (await select.count() > 0) {
-      await select.selectOption({ index: 1 });
+    // The project filter is a typeahead in the header. Open it and pick the
+    // first real project (index 0 is the "All Projects" option).
+    const trigger = page.locator('.typeahead-trigger').first();
+    await trigger.click();
+    await page.waitForSelector('.typeahead-option', { timeout: 5_000 });
+    const options = page.locator('.typeahead-option');
+    if (await options.count() > 1) {
+      await options.nth(1).click();
       await page.waitForTimeout(1000);
       await snap(page, 'session-filtered');
     }
@@ -469,27 +509,43 @@ test.describe('Message viewer', () => {
   });
 
   test('thinking blocks', async ({ page }) => {
-    await selectRichSession(page);
-    // showThinking defaults to true — don't press 't'
-    await page.waitForTimeout(500);
-
-    // Look for a thinking block already visible
-    const thinking = page.locator('.thinking-block').first();
-    if (await thinking.isVisible()) {
-      await snapEl(thinking, 'thinking-blocks');
+    // Sessions with thinking blocks are rare and never recent, so run.sh
+    // resolves one session id and passes it in; navigate straight there.
+    // Fall back to a rich session when the id is absent (e.g. local runs).
+    const thinkingId = process.env.SCREENSHOT_THINKING_SESSION_ID;
+    if (thinkingId) {
+      await page.goto('/sessions/' + encodeURIComponent(thinkingId));
+      await page.waitForSelector('.message', { timeout: 15_000 });
+      await page.waitForTimeout(500);
     } else {
-      // Scroll through messages to find one
+      await selectRichSession(page);
+      await page.waitForTimeout(500);
+    }
+
+    // Surface a thinking block, scrolling the virtualized transcript if needed.
+    let thinking = page.locator('.thinking-block').first();
+    if (await thinking.count() === 0) {
       const rows = page.locator('.message, .virtual-row');
-      const count = await rows.count();
-      for (let i = 0; i < Math.min(count, 40); i++) {
+      const rowCount = await rows.count();
+      for (let i = 0; i < Math.min(rowCount, 60); i++) {
         await rows.nth(i).scrollIntoViewIfNeeded();
-        await page.waitForTimeout(150);
-        const tb = page.locator('.thinking-block').first();
-        if (await tb.isVisible()) {
-          await snapEl(tb, 'thinking-blocks');
-          break;
-        }
+        await page.waitForTimeout(100);
+        if (await page.locator('.thinking-block').count() > 0) break;
       }
+      thinking = page.locator('.thinking-block').first();
+    }
+
+    if (await thinking.count() > 0) {
+      // Thinking blocks are collapsed by default; expand so the snap shows
+      // the reasoning text and not just the header strip.
+      const header = thinking.locator('.thinking-header');
+      if (await header.count() > 0) {
+        await header.click();
+        await page.waitForTimeout(300);
+      }
+      await thinking.scrollIntoViewIfNeeded();
+      await page.waitForTimeout(200);
+      await snapEl(thinking, 'thinking-blocks');
     }
   });
 
@@ -721,29 +777,29 @@ test.describe('Modals', () => {
   });
 
   test('resync modal', async ({ page }) => {
-    const gear = page.locator('button[title="Full resync"]');
-    if (await gear.count() > 0) {
-      await gear.click();
-      await page.waitForSelector('.resync-panel', {
-        timeout: 5_000,
-      });
-      await page.waitForTimeout(300);
-      await snap(page, 'resync-modal');
-      await page.keyboard.press('Escape');
-    }
+    // Resync now lives in Settings: open it, then trigger the modal.
+    await page.locator('button[title="Settings"]').click();
+    await page.waitForSelector('.resync-btn', { timeout: 5_000 });
+    await page.locator('.resync-btn').click();
+    await page.waitForSelector('.resync-panel', { timeout: 5_000 });
+    await page.waitForTimeout(300);
+    await snap(page, 'resync-modal');
+    await page.keyboard.press('Escape');
   });
 
   test('publish modal', async ({ page }) => {
     await selectFirstSession(page);
+    // 'p' publishes the active session. With no GitHub token configured the
+    // modal settles on its setup view, so no real gist URL is created.
     await page.keyboard.press('p');
-    await page.waitForTimeout(500);
-
-    const modal = page.locator(
-      '.publish-overlay, .publish-modal'
-    );
-    if (await modal.count() > 0) {
-      await snap(page, 'publish-modal');
-    }
+    await page.waitForSelector('.publish-panel', { timeout: 5_000 });
+    // With no token, the modal settles on the setup view (token input); wait
+    // for it so the snap is the stable setup state, not the initial spinner.
+    await page
+      .locator('.token-input')
+      .waitFor({ state: 'visible', timeout: 6_000 })
+      .catch(() => {});
+    await snap(page, 'publish-modal');
     await page.keyboard.press('Escape');
   });
 });
@@ -787,17 +843,16 @@ test.describe('Insights', () => {
   test('insight content', async ({ page }) => {
     await navigateToInsights(page);
 
-    // Select the first insight to show content
-    const rows = page.locator('.insight-row');
-    if (await rows.count() > 0) {
-      await rows.first().click();
-      await page.waitForTimeout(500);
-    }
-
-    const content = page.locator('.content-panel');
-    if (await content.count() > 0) {
-      await snapEl(content, 'insight-content');
-    }
+    // Select the first generated insight and snap its rendered detail.
+    // extract-db.sh seeds the archive with safe, synthetic reports.
+    const items = page.locator('.generated-list button');
+    await items.first().waitFor({ state: 'visible', timeout: 10_000 });
+    await items.first().click();
+    await page.waitForSelector('.generated-detail .markdown-body', {
+      timeout: 10_000,
+    });
+    await page.waitForTimeout(400);
+    await snapEl(page.locator('.generated-detail'), 'insight-content');
   });
 });
 
@@ -1555,5 +1610,32 @@ test.describe('Usage dashboard', () => {
     await page.waitForTimeout(300);
     await snap(page, 'usage-filter-dropdown');
     await page.keyboard.press('Escape');
+  });
+});
+
+// ── Recent Edits ────────────────────────────────────────
+
+test.describe('Recent Edits', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.setViewportSize(FULL);
+    await waitForApp(page);
+  });
+
+  test('recent edits feed', async ({ page }) => {
+    // Recent Edits is a top-level route reached from the More menu.
+    // Navigate directly, then expand the first file row so the
+    // screenshot shows both the grouped feed and a file's edits.
+    await page.goto('/recent-edits');
+    await page.waitForSelector('.recent-edits-page', {
+      timeout: 10_000,
+    });
+    await page.waitForSelector('.re-file', { timeout: 10_000 });
+
+    const firstRow = page.locator('.re-file-row').first();
+    await firstRow.click();
+    await page.waitForSelector('.re-edits', { timeout: 5_000 });
+    await page.waitForTimeout(500);
+
+    await snap(page, 'recent-edits');
   });
 });
