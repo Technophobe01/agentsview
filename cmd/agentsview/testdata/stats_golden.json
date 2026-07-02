@@ -89,6 +89,18 @@
     "dollars_saved_vs_uncached": 2.373315,
     "dollars_spent": 6.751545
   },
+  "code_attribution": {
+    "sources": [
+      {
+        "provider": "cursor",
+        "scope": "machine_local",
+        "status": "unavailable",
+        "warnings": [
+          "Cursor attribution database is unavailable on this machine"
+        ]
+      }
+    ]
+  },
   "distributions": {
     "duration_minutes": {
       "scope_all": {
