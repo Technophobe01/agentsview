@@ -115,6 +115,7 @@ const sessionFullCols = `id, project, machine, agent,
 	cwd, git_branch, source_session_id, source_version,
 	transcript_fidelity,
 	parser_malformed_lines, is_truncated,
+	last_write_incremental,
 	deleted_at, termination_status, file_path, file_size, file_mtime,
 	next_ordinal, last_entry_uuid,
 	file_inode, file_device,
@@ -328,11 +329,20 @@ type Session struct {
 	FileMtime         *int64  `json:"file_mtime,omitempty"`
 	NextOrdinal       int     `json:"-"`
 	LastEntryUUID     *string `json:"-"`
-	FileInode         *int64  `json:"file_inode,omitempty"`
-	FileDevice        *int64  `json:"file_device,omitempty"`
-	FileHash          *string `json:"file_hash,omitempty"`
-	LocalModifiedAt   *string `json:"local_modified_at,omitempty"`
-	CreatedAt         string  `json:"created_at"`
+	// LastWriteIncremental is SQLite-only sync bookkeeping (like
+	// NextOrdinal): true when the last write to this row went through
+	// the incremental-append path (updateSessionIncrementalTx) instead
+	// of a full re-normalization (upsertSessionArgs, which always resets
+	// it to false). It is consumed only by parse-diff to classify benign
+	// incremental-vs-full skew and is json:"-" so it never leaks through
+	// the HTTP session API. Deliberately not mirrored to PG/DuckDB: their
+	// push column lists omit the whole sync-bookkeeping cluster.
+	LastWriteIncremental bool    `json:"-"`
+	FileInode            *int64  `json:"file_inode,omitempty"`
+	FileDevice           *int64  `json:"file_device,omitempty"`
+	FileHash             *string `json:"file_hash,omitempty"`
+	LocalModifiedAt      *string `json:"local_modified_at,omitempty"`
+	CreatedAt            string  `json:"created_at"`
 }
 
 // SessionCursor is the opaque pagination token. EndedAt carries the
@@ -1054,6 +1064,7 @@ func (db *DB) GetSessionFull(
 		&s.SourceSessionID, &s.SourceVersion,
 		&s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
+		&s.LastWriteIncremental,
 		&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize,
 		&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
 		&s.FileInode, &s.FileDevice,
@@ -1206,10 +1217,11 @@ const upsertSessionSQL = `
 			source_version, transcript_fidelity,
 			parser_malformed_lines,
 			is_truncated,
+			last_write_incremental,
 			file_path, file_size, file_mtime,
 			next_ordinal, last_entry_uuid,
 			file_inode, file_device, file_hash
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			project = excluded.project,
 			machine = excluded.machine,
@@ -1237,6 +1249,15 @@ const upsertSessionSQL = `
 			transcript_fidelity = excluded.transcript_fidelity,
 			parser_malformed_lines = excluded.parser_malformed_lines,
 			is_truncated = excluded.is_truncated,
+			-- last_write_incremental is deliberately NOT touched on conflict.
+			-- A bare upsert rewrites only the session row, not the message
+			-- rows, so it is not a re-normalization: the append-only full-parse
+			-- path (Claude/Codex, ReplaceMessages=false) upserts the session and
+			-- appends new messages while leaving earlier incrementally written
+			-- rows in place. Clearing the marker here would make parse-diff
+			-- report that still-present benign skew as real drift. The marker is
+			-- reset only by a genuine full message replacement
+			-- (resetIncrementalMarkerTx), and seeded false on fresh INSERT.
 			file_path = excluded.file_path,
 			file_size = excluded.file_size,
 			file_mtime = excluded.file_mtime,
@@ -1267,6 +1288,11 @@ func upsertSessionArgs(s Session) []any {
 		s.SourceVersion, s.TranscriptFidelity,
 		s.ParserMalformedLines,
 		s.IsTruncated,
+		// last_write_incremental is seeded false on fresh INSERT: a brand-new
+		// row starts fully normalized. On conflict the column is left as-is
+		// (see upsertSessionSQL) because a bare upsert does not re-normalize
+		// the stored messages; only a full message replacement clears it.
+		false,
 		s.FilePath, s.FileSize, s.FileMtime,
 		s.NextOrdinal, s.LastEntryUUID,
 		s.FileInode, s.FileDevice, s.FileHash,
@@ -1814,7 +1840,12 @@ func updateSessionIncrementalTx(
 			peak_context_tokens = ?,
 			has_total_output_tokens = ?,
 			has_peak_context_tokens = ?,
-			termination_status = NULL
+			termination_status = NULL,
+			-- Mark the row as last written by the incremental-append path.
+			-- The full-replace writer (upsertSessionArgs) resets this to
+			-- false; parse-diff reads it to classify benign
+			-- incremental-vs-full skew.
+			last_write_incremental = 1
 		WHERE id = ?`,
 		update.EndedAt, update.MsgCount, update.UserMsgCount,
 		update.FileSize, update.FileMtime,
@@ -1863,6 +1894,27 @@ func (db *DB) UpdateSessionIncremental(
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing incremental update tx: %w", err)
+	}
+	return nil
+}
+
+// resetIncrementalMarkerTx clears last_write_incremental after a full
+// message re-normalization. It is the counterpart to the marker set in
+// updateSessionIncrementalTx: parse-diff reads the marker to suppress
+// benign incremental-append skew, so only a path that actually rewrites
+// every message row to the full-parse shape (ReplaceSessionContent,
+// ReplaceSessionMessages, the batch ReplaceMessages branch) may clear it.
+// A bare UpsertSession or an append-only write must not, or the
+// suppression self-heals prematurely and still-present skew reappears as
+// spurious drift.
+func resetIncrementalMarkerTx(tx *sql.Tx, sessionID string) error {
+	if _, err := tx.Exec(
+		`UPDATE sessions SET last_write_incremental = 0 WHERE id = ?`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf(
+			"resetting incremental marker for %s: %w", sessionID, err,
+		)
 	}
 	return nil
 }
@@ -3000,6 +3052,7 @@ func (db *DB) ListSessionsModifiedBetween(
 			&s.SourceSessionID, &s.SourceVersion,
 			&s.TranscriptFidelity,
 			&s.ParserMalformedLines, &s.IsTruncated,
+			&s.LastWriteIncremental,
 			&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize,
 			&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
 			&s.FileInode, &s.FileDevice,
