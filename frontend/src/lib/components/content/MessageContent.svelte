@@ -28,6 +28,7 @@
   import ToolBlock from "./ToolBlock.svelte";
   import ParallelGroup from "./ParallelGroup.svelte";
   import CodeBlock from "./CodeBlock.svelte";
+  import MermaidBlock from "./MermaidBlock.svelte";
   import SkillBlock from "./SkillBlock.svelte";
   import { CopyButton } from "@kenn-io/kit-ui";
   import { ui } from "../../stores/ui.svelte.js";
@@ -457,12 +458,26 @@
              (v1 simplification: text first, then all tools). -->
       {:else if segment.type === "code"}
         {#if hasSearchQuery || ui.isBlockVisible("code")}
-          <CodeBlock
-            content={segment.content}
-            language={segment.label}
-            highlightQuery={highlightQuery}
-            isCurrentHighlight={isCurrentHighlight}
-          />
+          {@const codeLabel = segment.label?.trim().toLowerCase()}
+          {#if codeLabel === "mermaid"}
+            {#if hasSearchQuery}
+              <CodeBlock
+                content={segment.content}
+                language={segment.label}
+                highlightQuery={highlightQuery}
+                isCurrentHighlight={isCurrentHighlight}
+              />
+            {:else}
+              <MermaidBlock content={segment.content} />
+            {/if}
+          {:else}
+            <CodeBlock
+              content={segment.content}
+              language={segment.label}
+              highlightQuery={highlightQuery}
+              isCurrentHighlight={isCurrentHighlight}
+            />
+          {/if}
         {/if}
       {:else if segment.type === "skill"}
         {#if showText}

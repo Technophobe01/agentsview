@@ -9,6 +9,9 @@ import MessageContent from "./MessageContent.svelte";
 const copyToClipboardMock = vi.hoisted(() =>
   vi.fn().mockResolvedValue(true),
 );
+const initMermaidRenderingMock = vi.hoisted(() =>
+  vi.fn(() => ({ renderNow: vi.fn(), disconnect: vi.fn() })),
+);
 
 const forkSessionMock = vi.hoisted(() => vi.fn());
 const sessionsState = vi.hoisted(() => ({
@@ -78,6 +81,20 @@ vi.mock("../../utils/highlight.js", async () => {
 
 vi.mock("../../utils/clipboard.js", () => ({
   copyToClipboard: copyToClipboardMock,
+}));
+
+// Stub MermaidBlock's kit-ui boundary: routing (fence -> pre.mermaid block
+// vs CodeBlock) is MessageContent's contract; the real rendering pipeline
+// is covered in MermaidBlock.svelte.test.ts.
+vi.mock("@kenn-io/kit-ui/utils/markdown-mermaid", () => ({
+  mermaidCodeFence: (code: string, lang: string) => {
+    if (lang !== "mermaid") return undefined;
+    const pre = document.createElement("pre");
+    pre.className = "mermaid";
+    pre.textContent = code;
+    return pre.outerHTML;
+  },
+  initMarkdownMermaidRendering: initMermaidRenderingMock,
 }));
 
 type MessageWithTokenFlags = Message & {
@@ -553,6 +570,70 @@ describe("MessageContent", () => {
     await tick();
 
     expect(document.querySelector("button.fork-btn")).toBeNull();
+
+    unmount(component);
+  });
+
+  it("routes mermaid fences through MermaidBlock", async () => {
+    const content = [
+      "Mermaid diagram:",
+      "",
+      "```mermaid",
+      "graph TD",
+      "A-->B",
+      "```",
+    ].join("\n");
+
+    const component = mount(MessageContent, {
+      target: document.body,
+      props: {
+        message: makeMessage({
+          content,
+          content_length: content.length,
+        }),
+      },
+    });
+
+    await tick();
+    await tick();
+
+    expect(document.body.textContent).toContain("Mermaid diagram:");
+    const pre = document.querySelector(".mermaid-block pre.mermaid");
+    expect(pre?.textContent).toBe("graph TD\nA-->B\n");
+    expect(initMermaidRenderingMock).toHaveBeenCalledTimes(1);
+
+    unmount(component);
+  });
+
+  it("renders mermaid source as a code block when search is active", async () => {
+    const content = [
+      "Mermaid diagram:",
+      "",
+      "```mermaid",
+      "graph TD",
+      "A-->SearchTarget",
+      "```",
+    ].join("\n");
+
+    const component = mount(MessageContent, {
+      target: document.body,
+      props: {
+        message: makeMessage({
+          content,
+          content_length: content.length,
+        }),
+        highlightQuery: "SearchTarget",
+        isCurrentHighlight: true,
+      },
+    });
+
+    await tick();
+
+    expect(initMermaidRenderingMock).not.toHaveBeenCalled();
+    expect(document.querySelector(".code-content")?.textContent).toContain(
+      "A-->SearchTarget",
+    );
+    expect(document.querySelector(".code-lang")?.textContent).toBe("mermaid");
 
     unmount(component);
   });
