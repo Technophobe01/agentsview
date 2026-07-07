@@ -367,6 +367,12 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"qoder prefix",
+			"qoder:sess-id",
+			AgentQoder,
+			true,
+		},
+		{
 			"remote deepseek tui prefix",
 			"devbox~deepseek-tui:sess-id",
 			AgentDeepSeekTUI,
@@ -446,6 +452,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentWorkBuddy,
 		AgentZencoder,
 		AgentGptme,
+		AgentQoder,
 		AgentQwenPaw,
 		AgentShelley,
 		AgentVibe,

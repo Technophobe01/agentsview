@@ -4196,7 +4196,12 @@ func providerProcessCacheKeyWithHash(
 }
 
 func providerFingerprintHashRequiredForFreshness(agent parser.AgentType) bool {
-	return agent == parser.AgentDevin
+	switch agent {
+	case parser.AgentDevin, parser.AgentQoder:
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *Engine) providerSkipCacheEntryFreshInDB(
@@ -7838,6 +7843,10 @@ func providerSourcePathNeedsFingerprint(path string) bool {
 	return path != "" && parser.ResolveSourceFilePath(path) != path
 }
 
+func providerSourceMtimeNeedsFingerprint(agent parser.AgentType) bool {
+	return agent == parser.AgentQoder
+}
+
 // providerSessionIsFork reports whether the session ID addresses a fork child
 // whose base differs from the resolved source session. Only Piebald uses the
 // "<chat>-<row>" fork-ID shape among the DB-backed providers.
@@ -7924,7 +7933,8 @@ func (e *Engine) SourceMtime(sessionID string) int64 {
 		return 0
 	}
 	if e.isProviderAuthoritative(def.Type) &&
-		providerSourcePathNeedsFingerprint(path) {
+		(providerSourcePathNeedsFingerprint(path) ||
+			providerSourceMtimeNeedsFingerprint(def.Type)) {
 		if mtime := e.providerSessionSourceMtime(
 			context.Background(), def, sessionID, rawSessionID, path,
 		); mtime != 0 {
@@ -8230,6 +8240,18 @@ func (e *Engine) SyncSingleSessionContext(
 			if workspace, _, ok := strings.Cut(bareID, ":"); ok &&
 				workspace != "" {
 				file.Project = workspace
+			}
+		}
+	case parser.AgentQoder:
+		for _, qoderDir := range e.agentDirs[parser.AgentQoder] {
+			rel, ok := isUnder(qoderDir, path)
+			if !ok {
+				continue
+			}
+			parts := strings.Split(rel, string(filepath.Separator))
+			if len(parts) == 2 || len(parts) == 4 && parts[2] == "subagents" {
+				file.Project = parser.DecodeQoderProjectDir(parts[0])
+				break
 			}
 		}
 	case parser.AgentReasonix:

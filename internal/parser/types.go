@@ -53,6 +53,7 @@ const (
 	AgentZed            AgentType = "zed"
 	AgentQwenPaw        AgentType = "qwenpaw"
 	AgentGptme          AgentType = "gptme"
+	AgentQoder          AgentType = "qoder"
 	AgentShelley        AgentType = "shelley"
 	AgentAider          AgentType = "aider"
 	AgentReasonix       AgentType = "reasonix"
@@ -581,6 +582,18 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".local/share/gptme/logs"},
 		IDPrefix:    "gptme:",
 		FileBased:   true,
+	},
+	{
+		Type:        AgentQoder,
+		DisplayName: "Qoder",
+		EnvVar:      "QODER_PROJECTS_DIR",
+		ConfigKey:   "qoder_project_dirs",
+		DefaultDirs: []string{
+			".qoder/projects",
+			".qoderwork/projects",
+		},
+		IDPrefix:  "qoder:",
+		FileBased: true,
 	},
 	{
 		// Shelley (exe.dev) stores all conversations in a single
