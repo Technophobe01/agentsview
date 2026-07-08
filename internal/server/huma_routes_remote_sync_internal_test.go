@@ -3,6 +3,7 @@ package server
 import (
 	"archive/tar"
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,11 +15,13 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/remotesync"
 )
 
 func newRemoteSyncServer(t *testing.T) (*Server, http.Handler, string) {
@@ -103,12 +106,165 @@ func TestRemoteSyncArchiveStreamsTar(t *testing.T) {
 	}
 }
 
+func TestRemoteSyncArchiveWindsurfStreamsSanitizedStateDB(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	database := dbtest.OpenTestDBAt(t, dbPath)
+	windsurfRoot := filepath.Join(dir, "Windsurf", "User")
+	workspaceDir := filepath.Join(windsurfRoot, "workspaceStorage", "workspace-a")
+	stateDB := filepath.Join(workspaceDir, parser.WindsurfStateDBName)
+	workspaceJSON := filepath.Join(workspaceDir, "workspace.json")
+	secretPath := filepath.Join(workspaceDir, "extension-secret.json")
+	require.NoError(t, os.MkdirAll(workspaceDir, 0o755))
+	closeStateDB := writeWindsurfArchiveStateDB(t, stateDB)
+	defer closeStateDB()
+	require.NoError(t, os.WriteFile(workspaceJSON, []byte(`{"folder":"file:///work/demo"}`), 0o644))
+	require.NoError(t, os.WriteFile(secretPath, []byte("do not archive"), 0o644))
+	srv := New(config.Config{
+		Host:         "127.0.0.1",
+		Port:         8080,
+		DataDir:      dir,
+		DBPath:       dbPath,
+		AuthToken:    "remote-token",
+		RequireAuth:  false,
+		WriteTimeout: 30 * time.Second,
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentWindsurf: {windsurfRoot},
+		},
+	}, database, nil)
+	handler := srv.Handler()
+
+	targetReq := httptest.NewRequest(http.MethodGet, "/api/v1/remote-sync/targets", nil)
+	targetReq.Header.Set("Authorization", "Bearer remote-token")
+	targetW := httptest.NewRecorder()
+	handler.ServeHTTP(targetW, targetReq)
+	require.Equal(t, http.StatusOK, targetW.Code, "body: %s", targetW.Body.String())
+	var targets remotesync.TargetSet
+	require.NoError(t, json.Unmarshal(targetW.Body.Bytes(), &targets))
+	payload, err := json.Marshal(targets)
+	require.NoError(t, err)
+	archiveReq := httptest.NewRequest(http.MethodPost, "/api/v1/remote-sync/archive", bytes.NewReader(payload))
+	archiveReq.Header.Set("Authorization", "Bearer remote-token")
+	archiveReq.Header.Set("Content-Type", "application/json")
+	archiveW := httptest.NewRecorder()
+
+	handler.ServeHTTP(archiveW, archiveReq)
+
+	require.Equal(t, http.StatusOK, archiveW.Code, "body: %s", archiveW.Body.String())
+	archiveBytes := archiveW.Body.Bytes()
+	assert.NotContains(t, string(archiveBytes), "extension secret value")
+	entries := tarEntries(t, archiveBytes)
+	names := tarEntryNames(entries)
+	stateEntry, ok := tarEntryWithSuffix(entries, "workspace-a/"+parser.WindsurfStateDBName)
+	require.True(t, ok, "entries: %v", names)
+	assert.True(t, hasTarEntrySuffix(entries, "workspace-a/workspace.json"), "entries: %v", entries)
+	assert.False(t, hasTarEntrySuffix(entries, "workspace-a/extension-secret.json"), "entries: %v", entries)
+	assert.False(t, hasTarEntrySuffix(entries, "workspace-a/"+parser.WindsurfStateDBName+"-wal"), "entries: %v", entries)
+	assert.False(t, hasTarEntrySuffix(entries, "workspace-a/"+parser.WindsurfStateDBName+"-shm"), "entries: %v", entries)
+	assertSanitizedWindsurfArchiveDB(t, stateEntry.Body)
+}
+
 func pathBaseSlash(p string) string {
 	i := strings.LastIndex(p, "/")
 	if i < 0 {
 		return p
 	}
 	return p[i+1:]
+}
+
+type tarTestEntry struct {
+	Name string
+	Body []byte
+}
+
+func tarEntries(t *testing.T, archive []byte) []tarTestEntry {
+	t.Helper()
+	tr := tar.NewReader(bytes.NewReader(archive))
+	var entries []tarTestEntry
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return entries
+		}
+		require.NoError(t, err)
+		body, err := io.ReadAll(tr)
+		require.NoError(t, err)
+		entries = append(entries, tarTestEntry{Name: hdr.Name, Body: body})
+	}
+}
+
+func tarEntryNames(entries []tarTestEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name)
+	}
+	return names
+}
+
+func hasTarEntrySuffix(entries []tarTestEntry, suffix string) bool {
+	_, ok := tarEntryWithSuffix(entries, suffix)
+	return ok
+}
+
+func tarEntryWithSuffix(entries []tarTestEntry, suffix string) (tarTestEntry, bool) {
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name, suffix) {
+			return entry, true
+		}
+	}
+	return tarTestEntry{}, false
+}
+
+func writeWindsurfArchiveStateDB(t *testing.T, dbPath string) func() {
+	t.Helper()
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	conn.SetMaxOpenConns(1)
+	_, err = conn.Exec(`PRAGMA journal_mode=WAL`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(
+		`INSERT INTO ItemTable (key, value) VALUES (?, ?)`,
+		"workbench.panel.aichat.view.aichat.chatdata",
+		`{"version":1,"sessionId":"remote-windsurf","requests":[{"requestId":"request-1","message":{"text":"Remote chat"},"response":[{"value":"Remote answer"}],"timestamp":1710000000000}]}`,
+	)
+	require.NoError(t, err)
+	_, err = conn.Exec(
+		`INSERT INTO ItemTable (key, value) VALUES (?, ?)`,
+		"extension.secret",
+		"extension secret value",
+	)
+	require.NoError(t, err)
+	require.FileExists(t, dbPath+"-wal")
+	return func() {
+		require.NoError(t, conn.Close())
+	}
+}
+
+func assertSanitizedWindsurfArchiveDB(t *testing.T, body []byte) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "state.vscdb")
+	require.NoError(t, os.WriteFile(dbPath, body, 0o644))
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer conn.Close()
+	rows, err := conn.Query(`SELECT key, value FROM ItemTable ORDER BY key`)
+	require.NoError(t, err)
+	defer rows.Close()
+	got := make(map[string]string)
+	for rows.Next() {
+		var key, value string
+		require.NoError(t, rows.Scan(&key, &value))
+		got[key] = value
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, got, 1)
+	for key, value := range got {
+		assert.Equal(t, "workbench.panel.aichat.view.aichat.chatdata", key)
+		assert.Contains(t, value, "Remote chat")
+		assert.NotContains(t, value, "extension secret value")
+	}
 }
 
 func TestRemoteSyncArchiveDoesNotAppendErrorAfterStreamingStarts(t *testing.T) {

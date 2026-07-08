@@ -46,11 +46,7 @@ func TestResolveScriptExcludesDevinProviderRoot(t *testing.T) {
 	devinRoot := filepath.Join(home, ".local", "share", "devin")
 	require.NoError(t, os.MkdirAll(devinRoot, 0o755))
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home, "DEVIN_DIR=" + devinRoot}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home, "DEVIN_DIR="+devinRoot)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	assert.NotContains(t, dirs, parser.AgentDevin)
@@ -62,14 +58,10 @@ func TestResolveScriptHonorsClaudeConfigDirRoot(t *testing.T) {
 	projectsDir := filepath.Join(root, "projects")
 	require.NoError(t, os.MkdirAll(projectsDir, 0o755), "mkdir projects")
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{
-		"HOME=" + home,
-		"CLAUDE_CONFIG_DIR=" + root,
-	}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t,
+		"HOME="+home,
+		"CLAUDE_CONFIG_DIR="+root,
+	)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	assert.Contains(t, dirs[parser.AgentClaude], root+"/projects")
@@ -99,11 +91,7 @@ func TestResolveScriptExitsZero(t *testing.T) {
 	// The resolve script must exit 0 even when no agent
 	// dirs exist. Verify by running it against an empty
 	// HOME so no default dirs are found.
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=/nonexistent"}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME=/nonexistent")
 	// No dirs should be found.
 	assert.Empty(t, strings.TrimSpace(string(out)))
 }
@@ -119,11 +107,7 @@ func TestResolveScriptIncludesCodexIndex(t *testing.T) {
 	indexPath := filepath.Join(home, ".codex", "session_index.jsonl")
 	require.NoError(t, os.WriteFile(indexPath, []byte("{}\n"), 0o644), "write index")
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home)
 
 	// The script runs in a POSIX shell (MSYS on Windows), so it emits
 	// forward-slash paths that differ from native filepath.Join output.
@@ -155,11 +139,7 @@ func TestResolveScriptSkipsMissingCodexIndex(t *testing.T) {
 		os.MkdirAll(filepath.Join(home, ".codex", "sessions"), 0o755),
 		"mkdir sessions")
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home)
 
 	_, extraFiles := parseResolvedDirs(string(out))
 	assert.Empty(t, extraFiles,
@@ -178,11 +158,7 @@ func TestResolveScriptSkipsAiderHomeDefault(t *testing.T) {
 		0o644,
 	), "write history")
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	assert.Empty(t, dirs[parser.AgentAider],
@@ -220,11 +196,7 @@ func TestResolveScriptAiderScopedByEnvFindsHistoryFiles(t *testing.T) {
 	deepHistory := filepath.Join(deepDir, parser.AiderHistoryFileName())
 	require.NoError(t, os.WriteFile(deepHistory, []byte("# aider\n"), 0o644))
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home, "AIDER_DIR=" + codeRoot}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home, "AIDER_DIR="+codeRoot)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	aiderTargets := slashPaths(dirs[parser.AgentAider])
@@ -250,11 +222,7 @@ func TestResolveScriptAiderNewlinePathCannotInjectTarget(t *testing.T) {
 	maliciousHistory := filepath.Join(maliciousDir, parser.AiderHistoryFileName())
 	require.NoError(t, os.WriteFile(maliciousHistory, []byte("# aider\n"), 0o644))
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home, "AIDER_DIR=" + codeRoot}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home, "AIDER_DIR="+codeRoot)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	assert.NotContains(t, dirs[parser.AgentAider], injected,
@@ -279,18 +247,71 @@ func slashPaths(paths []string) []string {
 func TestResolveScriptAiderRejectsHomeOverride(t *testing.T) {
 	home := t.TempDir()
 
-	script := buildResolveScript()
 	for _, override := range []string{home, home + "/"} {
-		cmd := exec.Command("sh", "-c", script)
-		cmd.Env = []string{"HOME=" + home, "AIDER_DIR=" + override}
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "resolve script failed: output: %s", out)
+		out := runResolveScriptForTest(t, "HOME="+home, "AIDER_DIR="+override)
 
 		dirs, _ := parseResolvedDirs(string(out))
 		assert.Empty(t, dirs[parser.AgentAider],
 			"AIDER_DIR=%q (== $HOME) must not resolve to a whole-home tar, got %v",
 			override, dirs[parser.AgentAider])
 	}
+}
+
+func TestResolveScriptWindsurfTargetsOnlySessionFiles(t *testing.T) {
+	home := t.TempDir()
+	userRoot := filepath.Join(home, "AppData", "Roaming", "Windsurf", "User")
+	workspaceRoot := filepath.Join(userRoot, "workspaceStorage")
+	workspaceDir := filepath.Join(workspaceRoot, "workspace-a")
+	stateDB := filepath.Join(workspaceDir, parser.WindsurfStateDBName)
+	stateWAL := stateDB + "-wal"
+	stateSHM := stateDB + "-shm"
+	workspaceJSON := filepath.Join(workspaceDir, "workspace.json")
+	secretPath := filepath.Join(workspaceDir, "extension-secret.json")
+	require.NoError(t, os.MkdirAll(workspaceDir, 0o755))
+	require.NoError(t, os.WriteFile(stateDB, []byte("state"), 0o644))
+	require.NoError(t, os.WriteFile(stateWAL, []byte("wal"), 0o644))
+	require.NoError(t, os.WriteFile(stateSHM, []byte("shm"), 0o644))
+	require.NoError(t, os.WriteFile(workspaceJSON, []byte("{}\n"), 0o644))
+	require.NoError(t, os.WriteFile(secretPath, []byte("secret"), 0o644))
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+
+	records := resolveOutputRecords(string(out))
+	userRootSuffix := filepath.ToSlash(filepath.Join("AppData", "Roaming", "Windsurf", "User"))
+	workspaceRootSuffix := filepath.ToSlash(filepath.Join(userRootSuffix, "workspaceStorage"))
+	workspaceSuffix := filepath.ToSlash(filepath.Join(workspaceRootSuffix, "workspace-a"))
+	agentFilePrefix := resolveAgentFilePrefix + ":" + string(parser.AgentWindsurf)
+	assert.True(t, hasRecordWithPathSuffix(records, string(parser.AgentWindsurf), userRootSuffix))
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, parser.WindsurfStateDBName))))
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, parser.WindsurfStateDBName+"-wal"))))
+	assert.False(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, parser.WindsurfStateDBName+"-shm"))))
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, "workspace.json"))))
+	assert.False(t, hasRecordWithPathSuffix(records, string(parser.AgentWindsurf), workspaceRootSuffix))
+	assert.False(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, filepath.Base(secretPath)))))
+}
+
+func hasRecordWithPathSuffix(records []string, prefix, suffix string) bool {
+	for _, record := range records {
+		if strings.HasPrefix(record, prefix+":") && strings.HasSuffix(record, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func runResolveScriptForTest(t *testing.T, env ...string) []byte {
+	t.Helper()
+	cmd := exec.Command("sh")
+	cmd.Stdin = strings.NewReader(buildResolveScript())
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "resolve script failed: output: %s", out)
+	return out
 }
 
 func TestParseResolvedDirs(t *testing.T) {
@@ -329,6 +350,24 @@ func TestParseResolvedDirsNULRecords(t *testing.T) {
 	assert.Equal(t,
 		[]string{"/home/wes/code/repo/.aider.chat.history.md"},
 		dirs[parser.AgentAider])
+	assert.Equal(t,
+		[]string{"/home/wes/.codex/session_index.jsonl"}, extraFiles)
+}
+
+func TestParseResolvedTargetsIncludesAgentFiles(t *testing.T) {
+	input := "windsurf:/home/wes/Windsurf/User\x00" +
+		"@agentfile:windsurf:/home/wes/Windsurf/User/workspaceStorage/a/state.vscdb\x00" +
+		"@agentfile:windsurf:/home/wes/Windsurf/User/workspaceStorage/a/state.vscdb\x00" +
+		"@agentfile:windsurf:/home/wes/Windsurf/User/workspaceStorage/a/workspace.json\x00" +
+		"@file:/home/wes/.codex/session_index.jsonl\x00"
+
+	dirs, files, extraFiles := parseResolvedTargets(input)
+
+	assert.Equal(t, []string{"/home/wes/Windsurf/User"}, dirs[parser.AgentWindsurf])
+	assert.Equal(t, []string{
+		"/home/wes/Windsurf/User/workspaceStorage/a/state.vscdb",
+		"/home/wes/Windsurf/User/workspaceStorage/a/workspace.json",
+	}, files[parser.AgentWindsurf])
 	assert.Equal(t,
 		[]string{"/home/wes/.codex/session_index.jsonl"}, extraFiles)
 }

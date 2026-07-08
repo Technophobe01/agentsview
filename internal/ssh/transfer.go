@@ -14,25 +14,66 @@ import (
 	"go.kenn.io/agentsview/internal/remotesync"
 )
 
-// buildTarCommand generates the remote tar command for the given
-// agent directories and extra files. Uses -C / so paths are relative
-// to root. Strips leading / from each path and shell-quotes it. The
-// extra files are resolved to exist on the remote (see
-// buildResolveScript), so tar does not fail on a missing path.
+// buildTarCommand generates the remote shell script for the given
+// agent directories, agent-scoped files, and extra files. Uses -C /
+// so paths are relative to root, and feeds paths to tar over stdin
+// instead of expanding them as tar argv. The script itself is sent to
+// the remote shell over stdin, so a large file-scoped Windsurf export
+// does not consume ssh/exec argument space.
 func buildTarCommand(
 	dirs map[parser.AgentType][]string,
+	files map[parser.AgentType][]string,
 	extraFiles []string,
 ) string {
 	var paths []string
-	for _, agentDirs := range dirs {
+	for agent, agentDirs := range dirs {
+		if _, fileScoped := files[agent]; fileScoped {
+			continue
+		}
 		for _, d := range agentDirs {
-			paths = append(paths, shellQuote(strings.TrimPrefix(d, "/")))
+			if path := tarListPath(d); path != "" {
+				paths = append(paths, shellQuote(path))
+			}
+		}
+	}
+	for _, agentFiles := range files {
+		for _, f := range agentFiles {
+			if path := tarListPath(f); path != "" {
+				paths = append(paths, shellQuote(path))
+			}
 		}
 	}
 	for _, f := range extraFiles {
-		paths = append(paths, shellQuote(strings.TrimPrefix(f, "/")))
+		if path := tarListPath(f); path != "" {
+			paths = append(paths, shellQuote(path))
+		}
 	}
-	return "tar cf - -C / -- " + strings.Join(paths, " ")
+	var b strings.Builder
+	b.WriteString("set -e\n")
+	b.WriteString("av_emit_tar_path() { [ -e \"/$1\" ] || return 0; printf '%s\\n' \"$1\"; }\n")
+	b.WriteString("{\n")
+	b.WriteString(":\n")
+	for _, path := range paths {
+		b.WriteString("av_emit_tar_path ")
+		b.WriteString(path)
+		b.WriteByte('\n')
+	}
+	b.WriteString("} | tar cf - -C / -T -\n")
+	return b.String()
+}
+
+func tarListPath(path string) string {
+	if strings.ContainsAny(path, "\x00\n\r") {
+		return ""
+	}
+	rel := strings.TrimPrefix(path, "/")
+	if rel == "" || rel == "." {
+		return ""
+	}
+	if strings.HasPrefix(rel, "./") {
+		return rel
+	}
+	return "./" + rel
 }
 
 // shellQuote wraps s in single quotes, escaping any embedded
@@ -47,10 +88,11 @@ func downloadAndExtract(
 	ctx context.Context,
 	host, user string, port int, sshOpts []string,
 	dirs map[parser.AgentType][]string,
+	files map[parser.AgentType][]string,
 	extraFiles []string,
 ) (string, error) {
-	tarCmd := buildTarCommand(dirs, extraFiles)
-	stdout, cleanup, err := runSSHStream(
+	tarCmd := buildTarCommand(dirs, files, extraFiles)
+	stdout, cleanup, err := runSSHScriptStream(
 		ctx, host, user, port, sshOpts, tarCmd,
 	)
 	if err != nil {

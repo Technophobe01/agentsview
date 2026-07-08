@@ -14,6 +14,10 @@ import (
 // is not a valid agent type, so parseResolvedDirs routes it separately.
 const resolveFilePrefix = "@file"
 
+// resolveAgentFilePrefix marks lines that name an agent-scoped file to
+// transfer without recursively archiving that agent's root directory.
+const resolveAgentFilePrefix = "@agentfile"
+
 const resolveRecordSep = "\x00"
 
 func aiderSkipDirCasePattern() string {
@@ -74,17 +78,52 @@ func buildAiderResolveSnippet(envVar string) string {
 func buildResolveScript() string {
 	var b strings.Builder
 	b.WriteString(
-		"av_emit_dir() { " +
+		"av_emit_agent_file() { " +
+			"agent=\"$1\"; " +
+			"file=\"$2\"; " +
+			"[ -f \"$file\" ] && printf '%s\\000' \"" + resolveAgentFilePrefix + ":$agent:$file\"; " +
+			"}\n" +
+			"av_emit_windsurf_target() { " +
+			"target=\"$1\"; " +
+			"case \"$target\" in */) target=\"${target%/}\";; esac; " +
+			"workspace=\"$target\"; " +
+			"case \"$workspace\" in */workspaceStorage) ;; " +
+			"*) workspace=\"$workspace/workspaceStorage\";; esac; " +
+			"[ -d \"$workspace\" ] || return; " +
+			"av_windsurf_root_emitted=0; " +
+			"for av_windsurf_ws in \"$workspace\"/*; do " +
+			"[ -d \"$av_windsurf_ws\" ] || continue; " +
+			"av_windsurf_db=\"$av_windsurf_ws/" + parser.WindsurfStateDBName + "\"; " +
+			"[ -f \"$av_windsurf_db\" ] || continue; " +
+			"if [ \"$av_windsurf_root_emitted\" -eq 0 ]; then " +
+			"printf '%s\\000' \"" + string(parser.AgentWindsurf) + ":$target\"; " +
+			"av_windsurf_root_emitted=1; " +
+			"fi; " +
+			"for av_windsurf_file in \"$av_windsurf_db\" \"$av_windsurf_db-wal\" \"$av_windsurf_ws/workspace.json\"; do " +
+			"av_emit_agent_file \"" + string(parser.AgentWindsurf) + "\" \"$av_windsurf_file\"; " +
+			"done; " +
+			"done; " +
+			"}\n" +
+			"av_emit_target() { " +
+			"agent=\"$1\"; " +
+			"target=\"$2\"; " +
+			"if [ \"$agent\" = \"" + string(parser.AgentWindsurf) + "\" ]; then " +
+			"av_emit_windsurf_target \"$target\"; " +
+			"return; " +
+			"fi; " +
+			"[ -d \"$target\" ] && printf '%s\\000' \"$agent:$target\"; " +
+			"}\n" +
+			"av_emit_dir() { " +
 			"dir=\"$1\"; " +
 			"[ -n \"$dir\" ] || dir=\"$2\"; " +
-			"[ -d \"$dir\" ] && printf '%s\\000' \"$3:$dir\"; " +
+			"av_emit_target \"$3\" \"$dir\"; " +
 			"}\n" +
 			"av_emit_rooted_dir() { " +
 			"dir=\"$1\"; " +
 			"root=\"$2\"; " +
 			"[ -z \"$dir\" ] && [ -n \"$root\" ] && dir=\"$root$3\"; " +
 			"[ -n \"$dir\" ] || dir=\"$4\"; " +
-			"[ -d \"$dir\" ] && printf '%s\\000' \"$5:$dir\"; " +
+			"av_emit_target \"$5\" \"$dir\"; " +
 			"}\n" +
 			"av_emit_codex_index() { " +
 			"idx=\"${dir%/*}/" + parser.CodexSessionIndexFilename + "\"; " +
@@ -184,20 +223,22 @@ func resolveAgentHasOnDiskSource(def parser.AgentDef) bool {
 	}
 }
 
-// parseResolvedDirs parses script output into a map of agent type to transfer
-// target paths plus a deduplicated list of extra files (records tagged with
-// resolveFilePrefix). Generated resolver output is NUL-delimited so remote
-// paths containing newlines cannot inject extra records; newline-delimited input
-// is accepted only for older tests and defensive compatibility. Most agent
-// targets are directories; Aider targets are individual .aider.chat.history.md
-// files. Skips empty records, empty values, and values containing record
-// separators.
-func parseResolvedDirs(
+// parseResolvedTargets parses script output into agent root paths,
+// agent-scoped files, and a deduplicated list of extra files (records
+// tagged with resolveFilePrefix). Generated resolver output is
+// NUL-delimited so remote paths containing newlines cannot inject extra
+// records; newline-delimited input is accepted only for older tests and
+// defensive compatibility. Most agent targets are directories; Aider
+// targets are individual .aider.chat.history.md files. Skips empty
+// records, empty values, and values containing record separators.
+func parseResolvedTargets(
 	output string,
-) (map[parser.AgentType][]string, []string) {
+) (map[parser.AgentType][]string, map[parser.AgentType][]string, []string) {
 	dirs := make(map[parser.AgentType][]string)
+	files := make(map[parser.AgentType][]string)
 	var extraFiles []string
 	seenFile := make(map[string]struct{})
+	seenAgentFile := make(map[parser.AgentType]map[string]struct{})
 	for _, record := range resolveOutputRecords(output) {
 		record = strings.TrimSpace(record)
 		if record == "" {
@@ -215,6 +256,27 @@ func parseResolvedDirs(
 			extraFiles = append(extraFiles, value)
 			continue
 		}
+		if key == resolveAgentFilePrefix {
+			agent, pathValue, ok := strings.Cut(value, ":")
+			if !ok || invalidResolvedPath(pathValue) {
+				continue
+			}
+			at := parser.AgentType(agent)
+			if at == "" {
+				continue
+			}
+			seen, ok := seenAgentFile[at]
+			if !ok {
+				seen = make(map[string]struct{})
+				seenAgentFile[at] = seen
+			}
+			if _, dup := seen[pathValue]; dup {
+				continue
+			}
+			seen[pathValue] = struct{}{}
+			files[at] = append(files[at], pathValue)
+			continue
+		}
 		at := parser.AgentType(key)
 		if at == parser.AgentAider &&
 			path.Base(value) != parser.AiderHistoryFileName() {
@@ -222,6 +284,13 @@ func parseResolvedDirs(
 		}
 		dirs[at] = append(dirs[at], value)
 	}
+	return dirs, files, extraFiles
+}
+
+func parseResolvedDirs(
+	output string,
+) (map[parser.AgentType][]string, []string) {
+	dirs, _, extraFiles := parseResolvedTargets(output)
 	return dirs, extraFiles
 }
 
@@ -229,6 +298,12 @@ func parseResolvedDirs(
 // internal/remotesync parity tests.
 func ParseResolvedTargetsForTest(output string) (map[parser.AgentType][]string, []string) {
 	return parseResolvedDirs(output)
+}
+
+func ParseResolvedTargetsWithFilesForTest(
+	output string,
+) (map[parser.AgentType][]string, map[parser.AgentType][]string, []string) {
+	return parseResolvedTargets(output)
 }
 
 func resolveOutputRecords(output string) []string {
@@ -248,12 +323,12 @@ func invalidResolvedPath(value string) bool {
 func resolveDirs(
 	ctx context.Context,
 	host, user string, port int, sshOpts []string,
-) (map[parser.AgentType][]string, []string, error) {
+) (map[parser.AgentType][]string, map[parser.AgentType][]string, []string, error) {
 	script := buildResolveScript()
-	out, err := runSSH(ctx, host, user, port, sshOpts, script)
+	out, err := runSSHScript(ctx, host, user, port, sshOpts, script)
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve dirs: %w", err)
+		return nil, nil, nil, fmt.Errorf("resolve dirs: %w", err)
 	}
-	dirs, extraFiles := parseResolvedDirs(string(out))
-	return dirs, extraFiles, nil
+	dirs, files, extraFiles := parseResolvedTargets(string(out))
+	return dirs, files, extraFiles, nil
 }
