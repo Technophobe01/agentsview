@@ -444,6 +444,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentPiebald,
 		AgentWarp,
 		AgentPositron,
+		AgentPositAssistant,
 		AgentZCode,
 		AgentZed,
 		AgentAntigravity,
