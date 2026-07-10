@@ -5,9 +5,52 @@ description: All AgentsView commands, flags, and environment variables
 
 ## Commands
 
+### `agentsview daemon`
+
+Manage the detached writable SQLite server:
+
+```bash
+agentsview daemon start
+agentsview daemon status
+agentsview daemon restart
+agentsview daemon stop
+```
+
+| Command   | Behavior                                                                |
+| --------- | ----------------------------------------------------------------------- |
+| `start`   | Start the daemon, or report the existing writable daemon                |
+| `status`  | Show writable daemon state, URL, PID, version, and uptime               |
+| `restart` | Stop and restart the writable daemon; start it if it is already stopped |
+| `stop`    | Stop the writable daemon, or report that it is already stopped          |
+
+`daemon start` and `daemon restart` load the normal effective configuration from
+`config.toml` and supported environment variables. They accept no serve-specific
+flags: persistent daemon settings belong in configuration. `--no-sync` is
+runtime-only and is not a `config.toml` setting. Use
+`agentsview serve --background --no-sync` when a one-off detached server must
+disable sync. Similarly, use `agentsview serve --background --host <address>`
+for a one-off unauthenticated non-loopback bind; a persistent non-loopback
+`host` in `config.toml` requires `require_auth = true`.
+
+These commands manage only the writable SQLite daemon for the current data
+directory. They ignore read-only `agentsview pg serve` and
+`agentsview duckdb serve` processes. If only read-only servers are running,
+`daemon status` reports that no daemon is running, and `daemon stop` and
+`daemon restart` leave those servers alive.
+
+Status distinguishes running, starting, and stopped states. If startup takes
+longer than the initial readiness wait, the child continues running; use
+`agentsview daemon status` and inspect the reported `serve.log`. If startup
+state remains stuck, follow the error's guidance to verify the owning process
+before terminating it manually and retrying.
+
+______________________________________________________________________
+
 ### `agentsview serve`
 
-Start the HTTP server with embedded web UI.
+Start the HTTP server with embedded web UI in the foreground. It remains
+attached to the terminal until you press `Ctrl+C`, unless `--background` is
+specified.
 
 ```bash
 agentsview serve [flags]
@@ -21,7 +64,9 @@ Running plain `agentsview` shows help instead of starting the web UI.
 | `--host`            | `127.0.0.1` | Host to bind to                                          |
 | `--port`            | `8080`      | Port to listen on                                        |
 | `--no-browser`      | `false`     | Don't open browser on startup                            |
+| `--no-sync`         | `false`     | Disable initial, watched, and periodic sync              |
 | `--no-update-check` | `false`     | Disable automatic update checks                          |
+| `--require-auth`    | `false`     | Require a bearer token for API requests                  |
 | `--background`      | `false`     | Start `agentsview serve` as a managed background process |
 | `--replace`         | `false`     | Replace a running local daemon before starting           |
 | `--public-url`      |             | Public URL for hostname or proxy access                  |
@@ -63,21 +108,28 @@ file watchers.
 
 #### Background Mode
 
-Use `--background` when you want the web UI to keep running after the launching
-shell exits:
+The existing `serve` background and lifecycle forms remain available:
 
 ```bash
 agentsview serve --background
 agentsview serve status
+agentsview serve restart
 agentsview serve stop
 ```
 
 The parent command starts a detached `agentsview serve` process, waits briefly
 for it to publish its runtime record, and prints the URL, PID, and log path.
 Background server output is written to `~/.agentsview/serve.log`. `serve status`
-reports the managed process, URL, version, uptime, and read-only mode when
-available. `serve stop` gracefully terminates the managed process and cleans up
-its runtime record.
+reports the preferred managed process, URL, version, uptime, and read-only mode
+when available. `serve stop` retains its broad lifecycle scope: it gracefully
+terminates confirmed writable SQLite and read-only PostgreSQL or DuckDB server
+processes for the data directory and cleans up their runtime records.
+
+`serve restart` is intentionally narrower and config-driven. It restarts only
+the writable SQLite daemon, leaves read-only servers alive, and starts the
+writable daemon if it was stopped. It accepts no serve flags and uses the same
+effective configuration as `daemon restart`. It is not equivalent to the broader
+`serve stop` followed by a foreground `serve` start.
 
 When a writable daemon is already running, a newer release binary automatically
 replaces an older compatible daemon before starting. Development builds,
@@ -86,7 +138,7 @@ downgrades, and forward API/data-version conflicts do not auto-replace; use
 daemon first. If the SQLite archive itself has a newer data version than the
 current binary can open, `serve` refuses before stopping the old daemon.
 `serve status` reports incompatible live daemons with their daemon and binary
-versions plus the `--replace` or `serve stop` actions.
+versions plus `daemon restart` or `daemon stop` guidance.
 
 Background servers also act as the shared local daemon for the desktop app and
 CLI. The daemon owns local SQLite writes for its data directory, so common write
@@ -185,8 +237,8 @@ token = "remote-token"
 With hosts configured, `agentsview sync` (no `--host`) runs the local sync
 first, then syncs each configured host in the order declared using its
 configured transport. `--full` applies to every host; for HTTP hosts it
-re-downloads the full archive into the persistent mirror and bypasses the
-remote path/mtime skip cache (see
+re-downloads the full archive into the persistent mirror and bypasses the remote
+path/mtime skip cache (see
 [Incremental Sync](/remote-access/#incremental-sync)). A failing host is
 reported on stderr and skipped so the remaining hosts still run; the command
 exits non-zero if any host failed.

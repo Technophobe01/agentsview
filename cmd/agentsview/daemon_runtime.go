@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -131,6 +132,34 @@ func processCreateTimeMillis(pid int) (int64, bool) {
 		return 0, false
 	}
 	return created, true
+}
+
+type processCreateTimeState int
+
+const (
+	processCreateTimeUnknown processCreateTimeState = iota
+	processCreateTimeMatch
+	processCreateTimeMismatch
+)
+
+func compareProcessCreateTime(
+	recorded string, live int64, liveOK bool,
+) processCreateTimeState {
+	recordedMillis, err := strconv.ParseInt(recorded, 10, 64)
+	if err != nil || recordedMillis <= 0 || !liveOK || live <= 0 {
+		return processCreateTimeUnknown
+	}
+	if recordedMillis == live {
+		return processCreateTimeMatch
+	}
+	return processCreateTimeMismatch
+}
+
+func processCreateTimeStateForPID(
+	pid int, recorded string,
+) processCreateTimeState {
+	live, ok := processCreateTimeMillis(pid)
+	return compareProcessCreateTime(recorded, live, ok)
 }
 
 // RemoveDaemonRuntime removes the current process's kit daemon runtime record.
@@ -394,6 +423,61 @@ func liveDaemonRecords(dataDir string) []daemon.RuntimeRecord {
 	return alive
 }
 
+type daemonRuntimeRecordStore interface {
+	CleanupDead() (int, error)
+	List() ([]daemon.RuntimeRecord, error)
+}
+
+// writableDaemonRecords returns every live writable agentsview runtime record.
+// It does not probe the daemon, so callers can recover or stop a hung process.
+func writableDaemonRecords(
+	dataDir string, authToken string,
+) ([]daemon.RuntimeRecord, error) {
+	migrateLegacyDaemonRuntimes(dataDir, authToken)
+	return writableDaemonRecordsFromStore(runtimeStore(dataDir))
+}
+
+func writableDaemonRecordsFromStore(
+	store daemonRuntimeRecordStore,
+) ([]daemon.RuntimeRecord, error) {
+	if _, err := store.CleanupDead(); err != nil {
+		return nil, fmt.Errorf("clean dead daemon runtime records: %w", err)
+	}
+	records, err := store.List()
+	if err != nil {
+		return nil, fmt.Errorf("list daemon runtime records: %w", err)
+	}
+
+	var writable []daemon.RuntimeRecord
+	for _, rec := range records {
+		if rec.Service != "" && rec.Service != daemonService {
+			continue
+		}
+		if !daemon.ProcessAlive(rec.PID) {
+			continue
+		}
+		if processCreateTimeStateForPID(
+			rec.PID, rec.Metadata[runtimeCreateTime],
+		) == processCreateTimeMismatch {
+			if rec.SourcePath != "" {
+				if err := os.Remove(rec.SourcePath); err != nil &&
+					!errors.Is(err, os.ErrNotExist) {
+					return nil, fmt.Errorf(
+						"remove mismatched daemon runtime record %s: %w",
+						rec.SourcePath, err,
+					)
+				}
+			}
+			continue
+		}
+		if daemonRuntimeFromRecord(rec).ReadOnly {
+			continue
+		}
+		writable = append(writable, rec)
+	}
+	return writable, nil
+}
+
 func hasLiveDaemonRuntime(dataDir string, authToken ...string) bool {
 	migrateLegacyDaemonRuntimes(dataDir, authToken...)
 
@@ -540,11 +624,16 @@ func runtimeRecordHasMismatchedCreateTime(
 	store daemon.RuntimeStore,
 	rec daemon.RuntimeRecord,
 ) bool {
-	recorded := rec.Metadata[runtimeCreateTime]
-	if recorded == "" || processCreateTimeMatches(rec.PID, recorded) {
+	if processCreateTimeStateForPID(
+		rec.PID, rec.Metadata[runtimeCreateTime],
+	) != processCreateTimeMismatch {
 		return false
 	}
-	if path, err := store.Path(rec.PID); err == nil {
+	path := rec.SourcePath
+	if path == "" {
+		path, _ = store.Path(rec.PID)
+	}
+	if path != "" {
 		_ = os.Remove(path)
 	}
 	return true

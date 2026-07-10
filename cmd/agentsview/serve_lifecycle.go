@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/config"
@@ -18,6 +20,129 @@ import (
 const serveStopGraceTimeout = 10 * time.Second
 
 var stopDaemonRuntimeForUpgrade = stopDaemonRuntimeForUpgradeImpl
+
+type daemonStopOperations struct {
+	confirmed func(daemon.RuntimeRecord, string) bool
+	stop      func(daemon.RuntimeRecord, time.Duration) error
+	cleanup   func(io.Writer, daemon.RuntimeRecord) error
+}
+
+// stopWritableDaemonRecordsSafely prevalidates the identity of every target
+// before signalling any of them. This prevents a corrupt multi-writer runtime
+// set from being only partially stopped when one record is stale or its PID
+// has been reused.
+func stopWritableDaemonRecordsSafely(
+	w io.Writer,
+	cfg config.Config,
+	records []daemon.RuntimeRecord,
+	ops daemonStopOperations,
+) error {
+	_, unconfirmedRecords := partitionConfirmedDaemonRecords(
+		records, cfg.AuthToken, ops.confirmed,
+	)
+	var unconfirmed []string
+	for _, rec := range unconfirmedRecords {
+		detail := fmt.Sprintf("pid %d", rec.PID)
+		if rec.SourcePath != "" {
+			detail += " (runtime record " + rec.SourcePath + ")"
+		}
+		unconfirmed = append(unconfirmed, detail)
+	}
+	if len(unconfirmed) > 0 {
+		return fmt.Errorf(
+			"cannot confirm every writable agentsview daemon: %s; no process was signalled; verify each process and terminate it manually before retrying",
+			strings.Join(unconfirmed, ", "),
+		)
+	}
+	stopped := make([]int, 0, len(records))
+	for i, rec := range records {
+		if !ops.confirmed(rec, cfg.AuthToken) {
+			if len(stopped) == 0 {
+				return fmt.Errorf(
+					"stop aborted before signaling; no process was signalled; remaining pids %s; pid %d identity changed; verify remaining processes and terminate them manually before retrying",
+					formatRecordPIDList(records[i:]), rec.PID,
+				)
+			}
+			return partialDaemonStopError(
+				stopped, records[i:],
+				fmt.Errorf("pid %d identity changed before signaling", rec.PID),
+			)
+		}
+		if err := ops.stop(rec, serveStopGraceTimeout); err != nil {
+			return partialDaemonStopError(
+				stopped, records[i:], fmt.Errorf("stopping pid %d: %w", rec.PID, err),
+			)
+		}
+		stopped = append(stopped, rec.PID)
+		fmt.Fprintf(w, "Stopped agentsview (pid %d).\n", rec.PID)
+		if err := ops.cleanup(w, rec); err != nil {
+			return partialDaemonStopError(
+				stopped, records[i+1:],
+				fmt.Errorf("managed caddy cleanup for pid %d: %w", rec.PID, err),
+			)
+		}
+	}
+	return nil
+}
+
+func partitionConfirmedDaemonRecords(
+	records []daemon.RuntimeRecord,
+	authToken string,
+	confirmed func(daemon.RuntimeRecord, string) bool,
+) (confirmedRecords, unconfirmedRecords []daemon.RuntimeRecord) {
+	for _, rec := range records {
+		if confirmed(rec, authToken) {
+			confirmedRecords = append(confirmedRecords, rec)
+		} else {
+			unconfirmedRecords = append(unconfirmedRecords, rec)
+		}
+	}
+	return confirmedRecords, unconfirmedRecords
+}
+
+func formatRecordPIDList(records []daemon.RuntimeRecord) string {
+	pids := make([]int, 0, len(records))
+	for _, rec := range records {
+		pids = append(pids, rec.PID)
+	}
+	return formatPIDList(pids)
+}
+
+func partialDaemonStopError(
+	stopped []int, remaining []daemon.RuntimeRecord, cause error,
+) error {
+	stoppedText := "none"
+	if len(stopped) > 0 {
+		stoppedText = formatPIDList(stopped)
+	}
+	remainingPIDs := make([]int, 0, len(remaining))
+	for _, rec := range remaining {
+		remainingPIDs = append(remainingPIDs, rec.PID)
+	}
+	remainingText := "none"
+	if len(remainingPIDs) > 0 {
+		remainingText = formatPIDList(remainingPIDs)
+	}
+	return fmt.Errorf(
+		"partial stop: stopped pid%s %s; remaining pids %s; %w; verify remaining processes and terminate them manually before retrying",
+		pluralSuffix(len(stopped)), stoppedText, remainingText, cause,
+	)
+}
+
+func formatPIDList(pids []int) string {
+	parts := make([]string, 0, len(pids))
+	for _, pid := range pids {
+		parts = append(parts, strconv.Itoa(pid))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func pluralSuffix(count int) string {
+	if count == 1 {
+		return ""
+	}
+	return "s"
+}
 
 // runServeStatus reports whether a server owns this data dir, and where to
 // reach it. It always exits zero; the output distinguishes the states.
@@ -131,8 +256,8 @@ func serveIncompatibleDaemonStatusLines(
 		decision,
 	)
 	return append(lines,
-		"Run `agentsview serve --replace` to replace it, or "+
-			"`agentsview serve stop` to stop it first.",
+		"Run `agentsview daemon restart` to replace it, or "+
+			"`agentsview daemon stop` to stop it first.",
 	)
 }
 
@@ -269,18 +394,9 @@ func processIdentityConfirmed(rec daemon.RuntimeRecord) bool {
 // or unparseable recordedMillis (legacy, or unreadable at write time) returns
 // false.
 func processCreateTimeMatches(pid int, recordedMillis string) bool {
-	if recordedMillis == "" {
-		return false
-	}
-	recorded, err := strconv.ParseInt(recordedMillis, 10, 64)
-	if err != nil {
-		return false
-	}
-	live, ok := processCreateTimeMillis(pid)
-	if !ok {
-		return false
-	}
-	return live == recorded
+	return processCreateTimeStateForPID(
+		pid, recordedMillis,
+	) == processCreateTimeMatch
 }
 
 // stopOrphanedCaddyChild terminates a managed Caddy child recorded in rec if it
@@ -291,30 +407,55 @@ func processCreateTimeMatches(pid int, recordedMillis string) bool {
 // otherwise keep holding the public port. The create time is matched exactly
 // before signalling, so a reused Caddy PID is never touched.
 func stopOrphanedCaddyChild(rec daemon.RuntimeRecord) {
+	if err := stopOrphanedCaddyChildWithWriter(os.Stdout, rec); err != nil {
+		raw := rec.Metadata[runtimeCaddyPID]
+		fmt.Printf(
+			"warning: could not stop managed caddy (pid %s): %v\n", raw, err,
+		)
+	}
+}
+
+// stopOrphanedCaddyChildWithWriter is the canonical, error-returning managed
+// Caddy cleanup path. Callers choose the output writer and decide whether a
+// cleanup failure is fatal to a larger lifecycle transition.
+func stopOrphanedCaddyChildWithWriter(
+	w io.Writer, rec daemon.RuntimeRecord,
+) error {
 	raw := rec.Metadata[runtimeCaddyPID]
 	if raw == "" {
-		return
+		return nil
 	}
 	pid, err := strconv.Atoi(raw)
 	if err != nil || pid <= 0 {
-		return
+		return nil
 	}
 	if !daemon.ProcessAlive(pid) {
-		return
+		return nil
 	}
 	caddyCreateTime := rec.Metadata[runtimeCaddyCreateTime]
-	if !processCreateTimeMatches(pid, caddyCreateTime) {
-		return
+	switch processCreateTimeStateForPID(pid, caddyCreateTime) {
+	case processCreateTimeMismatch:
+		return nil
+	case processCreateTimeUnknown:
+		return fmt.Errorf(
+			"managed caddy pid %d identity could not be confirmed; refusing to signal it",
+			pid,
+		)
+	case processCreateTimeMatch:
+		// Exact identity authorizes shutdown below.
+	default:
+		return fmt.Errorf(
+			"managed caddy pid %d identity could not be confirmed; refusing to signal it",
+			pid,
+		)
 	}
 	if err := stopDaemonProcess(
 		caddyStopRecord(pid, caddyCreateTime), serveStopGraceTimeout,
 	); err != nil {
-		fmt.Printf(
-			"warning: could not stop managed caddy (pid %d): %v\n", pid, err,
-		)
-		return
+		return err
 	}
-	fmt.Printf("Stopped managed caddy (pid %d).\n", pid)
+	fmt.Fprintf(w, "Stopped managed caddy (pid %d).\n", pid)
+	return nil
 }
 
 // caddyStopRecord builds the record used to stop a managed Caddy child. It has
@@ -335,6 +476,16 @@ func caddyStopRecord(pid int, createTime string) daemon.RuntimeRecord {
 // wait is never killed. It cleans up the runtime record if the process leaves
 // one behind.
 func stopDaemonProcess(rec daemon.RuntimeRecord, grace time.Duration) error {
+	return stopDaemonProcessWithIdentity(
+		rec, grace, processCreateTimeStateForPID,
+	)
+}
+
+func stopDaemonProcessWithIdentity(
+	rec daemon.RuntimeRecord,
+	grace time.Duration,
+	identityStateForPID func(int, string) processCreateTimeState,
+) error {
 	proc, err := os.FindProcess(rec.PID)
 	if err != nil {
 		return fmt.Errorf("finding process: %w", err)
@@ -346,40 +497,65 @@ func stopDaemonProcess(rec daemon.RuntimeRecord, grace time.Duration) error {
 		removeRuntimeRecordFile(rec)
 		return nil
 	}
-	if !recordedDaemonStillPresent(rec) {
+	identityState := identityStateForPID(
+		rec.PID, rec.Metadata[runtimeCreateTime],
+	)
+	switch identityState {
+	case processCreateTimeMismatch:
 		// The PID is alive but its identity no longer matches the record: the
 		// daemon exited during the grace wait and the PID was reused by an
 		// unrelated process. Do not force-kill the impostor; just drop the
 		// stale record.
 		removeRuntimeRecordFile(rec)
 		return nil
+	case processCreateTimeUnknown:
+		return processIdentityUnconfirmedError(rec, "after graceful shutdown")
+	case processCreateTimeMatch:
+		// Only an exact identity match authorizes force-kill escalation.
+	default:
+		return processIdentityUnconfirmedError(rec, "after graceful shutdown")
 	}
 	if err := proc.Kill(); err != nil {
 		return fmt.Errorf("force killing: %w", err)
 	}
-	if !waitForProcessExit(rec.PID, grace) && recordedDaemonStillPresent(rec) {
+	if waitForProcessExit(rec.PID, grace) {
+		removeRuntimeRecordFile(rec)
+		return nil
+	}
+	identityState = identityStateForPID(
+		rec.PID, rec.Metadata[runtimeCreateTime],
+	)
+	switch identityState {
+	case processCreateTimeMismatch:
+		// The daemon exited after SIGKILL and the PID was reused. The record
+		// is now proven stale, so remove it without signalling the new owner.
+		removeRuntimeRecordFile(rec)
+		return nil
+	case processCreateTimeUnknown:
+		return processIdentityUnconfirmedError(rec, "after force kill")
+	case processCreateTimeMatch:
 		// The recorded daemon genuinely outlived even SIGKILL. Keep the
 		// runtime record so other commands still see it owns the DB rather
-		// than racing it. (A live PID whose identity no longer matches the
-		// record was reused after the daemon exited, so fall through and
-		// remove the stale record.)
+		// than racing it.
 		return fmt.Errorf("process %d still running after force kill", rec.PID)
+	default:
+		return processIdentityUnconfirmedError(rec, "after force kill")
 	}
-	removeRuntimeRecordFile(rec)
-	return nil
 }
 
-// recordedDaemonStillPresent reports whether rec.PID still belongs to the
-// recorded daemon. With a persisted create time it is an exact identity match,
-// so a PID reused by an unrelated process is reported as not present. Without a
-// create time (legacy record) it conservatively assumes the live PID is still
-// the daemon.
-func recordedDaemonStillPresent(rec daemon.RuntimeRecord) bool {
-	raw := rec.Metadata[runtimeCreateTime]
-	if raw == "" {
-		return true
+func processIdentityUnconfirmedError(
+	rec daemon.RuntimeRecord, phase string,
+) error {
+	if rec.SourcePath != "" {
+		return fmt.Errorf(
+			"process %d identity could not be confirmed %s; refusing further signaling; runtime record preserved at %s for manual recovery",
+			rec.PID, phase, rec.SourcePath,
+		)
 	}
-	return processCreateTimeMatches(rec.PID, raw)
+	return fmt.Errorf(
+		"process %d identity could not be confirmed %s; refusing further signaling; inspect the process manually",
+		rec.PID, phase,
+	)
 }
 
 // waitForProcessExit polls until pid is gone or timeout elapses. It reports

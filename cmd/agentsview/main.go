@@ -541,7 +541,7 @@ func daemonRestartUpgradeHint() string {
 		"must be upgraded before it can be read. The upgrade runs when a " +
 		"writable daemon starts, so restart the daemon to let it run:\n" +
 		"  - desktop app: quit and relaunch it\n" +
-		"  - CLI: run `agentsview serve --replace`"
+		"  - CLI: run `agentsview daemon restart`"
 }
 
 func openWriteDB(
@@ -573,8 +573,7 @@ func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
 	if isExternalDaemonStarting(dataDir) || isLegacyDaemonStarting(dataDir) {
 		return fmt.Errorf(
 			"local daemon is starting and owns the SQLite archive; " +
-				"refusing to write directly. Retry once it is ready " +
-				"or run `agentsview serve stop` first",
+				"refusing to write directly. Retry once it is ready",
 		)
 	}
 	if isBackgroundLaunchActive(dataDir) &&
@@ -582,8 +581,7 @@ func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
 		!runningAsBackgroundChild() {
 		return fmt.Errorf(
 			"local daemon launch is in progress and owns the SQLite archive; " +
-				"refusing to write directly. Retry once it is ready " +
-				"or run `agentsview serve stop` first",
+				"refusing to write directly. Retry once it is ready",
 		)
 	}
 	if !hasLiveWritableDaemonRuntime(dataDir, cfg.AuthToken) {
@@ -598,7 +596,7 @@ func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
 		return fmt.Errorf(
 			"local daemon at %s owns the SQLite archive; refusing "+
 				"to write directly. Retry through the daemon or run "+
-				"`agentsview serve stop` first",
+				"`agentsview daemon stop` first",
 			urlFromDaemonRuntime(rt),
 		)
 	}
@@ -608,7 +606,7 @@ func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
 	}
 	return fmt.Errorf(
 		"%s; refusing to write directly. Retry through the daemon or "+
-			"run `agentsview serve stop` first",
+			"run `agentsview daemon stop` first",
 		reason,
 	)
 }
