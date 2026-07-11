@@ -41,6 +41,7 @@ const (
 	AgentKiroIDE        AgentType = "kiro-ide"
 	AgentCortex         AgentType = "cortex"
 	AgentHermes         AgentType = "hermes"
+	AgentGrok           AgentType = "grok"
 	AgentWorkBuddy      AgentType = "workbuddy"
 	AgentForge          AgentType = "forge"
 	AgentDevin          AgentType = "devin"
@@ -472,6 +473,15 @@ var Registry = []AgentDef{
 		FileBased:             true,
 		WatchRootsFunc:        ResolveHermesWatchRoots,
 		ShallowWatchRootsFunc: ResolveHermesShallowWatchRoots,
+	},
+	{
+		Type:        AgentGrok,
+		DisplayName: "Grok",
+		EnvVar:      "GROK_DIR",
+		ConfigKey:   "grok_dirs",
+		DefaultDirs: []string{".grok/sessions"},
+		IDPrefix:    "grok:",
+		FileBased:   true,
 	},
 	{
 		Type:        AgentWorkBuddy,
@@ -917,6 +927,10 @@ type ParsedSession struct {
 	// (e.g. VSCode Copilot). The sync engine forwards these into
 	// the usage_events table for catalog-based cost pricing.
 	UsageEvents []ParsedUsageEvent
+
+	// CountsAuthoritative marks parsers that own MessageCount and
+	// UserMessageCount even when they intentionally emit no transcript rows.
+	CountsAuthoritative bool
 
 	// aggregateTokenPresenceKnown marks session aggregate token
 	// coverage as parser-owned and authoritative.
