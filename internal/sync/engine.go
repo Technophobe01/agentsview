@@ -116,9 +116,13 @@ type Engine struct {
 	// non-interactive sessions (nil result). The file is
 	// retried when its mtime changes. S3 entries also keep an
 	// in-memory source fingerprint when one is available.
-	skipMu            gosync.RWMutex
-	skipCache         map[string]int64
-	skipFingerprints  map[string]string
+	skipMu           gosync.RWMutex
+	skipCache        map[string]int64
+	skipFingerprints map[string]string
+	// skipHashKeys maps a source base path to its one current
+	// ?source_hash= cache key. It is built once when the cache loads so a
+	// watcher mutation never scans unrelated archive entries.
+	skipHashKeys      map[string]string
 	s3CodexIndexMu    gosync.Mutex
 	s3CodexIndexCache map[string]s3CodexIndexSnapshot
 	// idPrefix and pathRewriter support remote sync:
@@ -257,6 +261,7 @@ func NewEngine(
 		migrateLegacyCodexExecSkips(database, skipCache)
 		migrateVisualStudioCopilotSkips(database, skipCache)
 	}
+	skipHashKeys, _ := normalizeSourceHashSkipCache(skipCache, nil)
 
 	dirs := make(map[parser.AgentType][]string, len(cfg.AgentDirs))
 	for k, v := range cfg.AgentDirs {
@@ -279,6 +284,7 @@ func NewEngine(
 		cwdFilter:               newCwdPrefixFilter(cfg.IncludeCwdPrefixes),
 		skipCache:               skipCache,
 		skipFingerprints:        make(map[string]string),
+		skipHashKeys:            skipHashKeys,
 		s3CodexIndexCache:       make(map[string]s3CodexIndexSnapshot),
 		ephemeral:               cfg.Ephemeral,
 		idPrefix:                cfg.IDPrefix,
@@ -1215,6 +1221,54 @@ func (e *Engine) ResyncAll(
 func (e *Engine) resyncAllLocked(
 	ctx context.Context, onProgress ProgressFunc,
 ) (stats SyncStats) {
+	stats, _ = e.resyncAllWithOptionsLocked(
+		ctx, onProgress, RebuildOptions{}, productionRebuildOperations,
+	)
+	// Preserve the legacy result shape; phase diagnostics are part of the
+	// options entrypoint's observable contract only.
+	stats.RebuildPhases = nil
+	e.mu.Lock()
+	e.lastSyncStats = stats
+	e.mu.Unlock()
+	return stats
+}
+
+// ResyncAllWithOptions atomically rebuilds the archive from the local sources
+// plus each configured contributor.
+func (e *Engine) ResyncAllWithOptions(
+	ctx context.Context, onProgress ProgressFunc, opts RebuildOptions,
+) (stats SyncStats, err error) {
+	return e.resyncAllWithOptionsAndOperations(
+		ctx, onProgress, opts, productionRebuildOperations,
+	)
+}
+
+func (e *Engine) resyncAllWithOptionsAndOperations(
+	ctx context.Context, onProgress ProgressFunc, opts RebuildOptions,
+	ops rebuildOperations,
+) (stats SyncStats, err error) {
+	if e.refuseWriteInForceParse("ResyncAllWithOptions") {
+		return SyncStats{}, nil
+	}
+	e.syncMu.Lock()
+	defer func() {
+		if stats.Synced > 0 && !stats.Aborted {
+			e.emit("sync")
+		}
+	}()
+	defer e.syncMu.Unlock()
+	defer e.clearCurrentProgress()
+	opts.includePhaseDiagnostics = true
+	return e.resyncAllWithOptionsLocked(
+		ctx, onProgress, opts, ops,
+	)
+}
+
+func (e *Engine) resyncAllWithOptionsLocked(
+	ctx context.Context, onProgress ProgressFunc, opts RebuildOptions,
+	ops rebuildOperations,
+) (stats SyncStats, retErr error) {
+	ops = ops.withDefaults()
 	reportResyncProgress := func(p Progress) {
 		p.Resync = true
 		if p.Phase == PhaseSyncing && p.Detail == "" {
@@ -1252,27 +1306,47 @@ func (e *Engine) resyncAllLocked(
 	// between storage and SQLite sources across resyncs. Fail closed:
 	// if we can't query, assume old DB has file-backed data
 	// worth protecting.
-	oldFileSessions, err := origDB.FileBackedSessionCount(
-		context.Background(),
-	)
+	oldFileSessions, err := e.protectedFileSessionCount(origDB, "", "", false)
 	if err != nil {
 		log.Printf("resync: get old file count: %v", err)
 		oldFileSessions = 1
-	} else {
-		oldFileSessions -= e.countRootOpenCodeFormatSessions(
-			origDB, parser.AgentOpenCode,
+	}
+	localOldFileSessions := oldFileSessions
+	rebuildOldFileSessions := oldFileSessions
+	contributorOldFileSessions := make([]int, len(opts.Contributors))
+	if len(opts.Contributors) > 0 {
+		localOldFileSessions, err = e.protectedFileSessionCount(
+			origDB, e.machine, "", e.machine != "",
 		)
-		oldFileSessions -= e.countRootOpenCodeFormatSessions(
-			origDB, parser.AgentKilo,
-		)
-		oldFileSessions -= e.countRootOpenCodeFormatSessions(
-			origDB, parser.AgentMiMoCode,
-		)
-		oldFileSessions -= e.countRootOpenCodeFormatSessions(
-			origDB, parser.AgentIcodemate,
-		)
-		if oldFileSessions < 0 {
-			oldFileSessions = 0
+		if err != nil {
+			log.Printf("resync: get old local file count: %v", err)
+			localOldFileSessions = 1
+		}
+		for i, contributor := range opts.Contributors {
+			count, countErr := e.protectedFileSessionCount(
+				origDB, contributor.Config.Machine,
+				contributor.Config.IDPrefix,
+				contributor.Config.Machine != "",
+			)
+			if countErr != nil {
+				log.Printf(
+					"resync: get old contributor %q file count: %v",
+					contributor.Name, countErr,
+				)
+				count = 1
+			}
+			contributorOldFileSessions[i] = count
+			if contributor.Config.Machine == e.machine &&
+				contributor.Config.IDPrefix != "" {
+				localOldFileSessions -= count
+				if localOldFileSessions < 0 {
+					localOldFileSessions = 0
+				}
+			}
+		}
+		rebuildOldFileSessions = localOldFileSessions
+		for _, count := range contributorOldFileSessions {
+			rebuildOldFileSessions += count
 		}
 	}
 
@@ -1284,12 +1358,15 @@ func (e *Engine) resyncAllLocked(
 	// matches the persisted DB until the next restart.
 	e.skipMu.Lock()
 	savedSkipCache := e.skipCache
+	savedSkipHashKeys := e.skipHashKeys
 	e.skipCache = make(map[string]int64)
+	e.skipHashKeys = make(map[string]string)
 	e.skipMu.Unlock()
 
 	restoreSkipCache := func() {
 		e.skipMu.Lock()
 		e.skipCache = savedSkipCache
+		e.skipHashKeys = savedSkipHashKeys
 		e.skipMu.Unlock()
 	}
 
@@ -1312,7 +1389,7 @@ func (e *Engine) resyncAllLocked(
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
-		return
+		return stats, err
 	}
 	if err := newDB.CopyArchiveIdentityFrom(origPath); err != nil {
 		log.Printf("resync: preserve archive identity: %v", err)
@@ -1378,7 +1455,7 @@ func (e *Engine) resyncAllLocked(
 			e.mu.Lock()
 			e.lastSyncStats = stats
 			e.mu.Unlock()
-			return
+			return stats, err
 		}
 		ftsDropped = true
 		log.Printf(
@@ -1405,8 +1482,112 @@ func (e *Engine) resyncAllLocked(
 	e.db = origDB // restore immediately
 	e.openCodeArchiveStore = nil
 	e.phaseStats.Log("resync")
+	if opts.includePhaseDiagnostics {
+		stats.RebuildPhases = append(stats.RebuildPhases,
+			phaseSnapshot("local", &e.phaseStats))
+	}
+	localStats := stats
+	if stats.Aborted || ctx.Err() != nil {
+		newDB.Close()
+		removeTempDB(tempPath)
+		restoreSkipCache()
+		stats.Aborted = true
+		stats.Warnings = append(stats.Warnings, fmt.Sprintf(
+			"resync aborted: %d synced, %d failed",
+			stats.Synced, stats.Failed,
+		))
+		e.mu.Lock()
+		e.lastSyncStats = stats
+		e.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+		return stats, nil
+	}
 
-	abortSwap := shouldAbortResyncSwap(stats, oldFileSessions, trashedCopied)
+	for contributorIndex, contributor := range opts.Contributors {
+		contributorEngine := NewEngine(newDB, contributor.Config)
+		contributorEngine.openCodeArchiveStore = origDB
+		contributorProgress := func(p Progress) {
+			if contributor.Progress != nil {
+				p = contributor.Progress(p)
+			}
+			p.SessionsDone += stats.TotalSessions
+			p.SessionsTotal += stats.TotalSessions
+			p.MessagesIndexed += stats.messagesIndexed
+			reportResyncProgress(p)
+		}
+		contributorStats := contributorEngine.syncAllLocked(
+			ctx, contributorProgress, time.Time{}, nil,
+			syncWriteBulk, true, false,
+		)
+		contributorEngine.phaseStats.Log("resync contributor " + contributor.Name)
+		phase := phaseSnapshot(contributor.Name, &contributorEngine.phaseStats)
+		contributorSafetyAbort := shouldAbortResyncSwap(
+			contributorStats,
+			contributorOldFileSessions[contributorIndex],
+			0,
+		)
+		mergeSyncStats(&stats, contributorStats)
+		if opts.includePhaseDiagnostics {
+			stats.RebuildPhases = append(stats.RebuildPhases, phase)
+		}
+		if contributorStats.Aborted || stats.Aborted || ctx.Err() != nil ||
+			contributorSafetyAbort {
+			contributorEngine.Close()
+			newDB.Close()
+			removeTempDB(tempPath)
+			restoreSkipCache()
+			stats.Aborted = true
+			stats.Warnings = append(stats.Warnings, fmt.Sprintf(
+				"resync aborted: contributor %q did not complete",
+				contributor.Name,
+			))
+			e.mu.Lock()
+			e.lastSyncStats = stats
+			e.mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return stats, err
+			}
+			return stats, nil
+		}
+		if contributor.AfterSync != nil {
+			if err := contributor.AfterSync(contributorEngine, newDB); err != nil {
+				contributorEngine.Close()
+				newDB.Close()
+				removeTempDB(tempPath)
+				restoreSkipCache()
+				if reopenErr := origDB.Reopen(); reopenErr != nil {
+					log.Printf("resync: contributor failure recovery reopen: %v", reopenErr)
+				}
+				stats.Aborted = true
+				stats.Warnings = append(stats.Warnings, fmt.Sprintf(
+					"resync contributor %q failed: %v",
+					contributor.Name, err,
+				))
+				e.mu.Lock()
+				e.lastSyncStats = stats
+				e.mu.Unlock()
+				return stats, &RebuildContributorError{
+					Contributor: contributor.Name,
+					Err:         err,
+				}
+			}
+		}
+		contributorEngine.Close()
+	}
+
+	localSafetyAbort := false
+	if len(opts.Contributors) > 0 {
+		// Evaluate local safety after contributors so a contributor's own
+		// cancellation or failure remains the reported abort reason. Trash
+		// copied from the old archive cannot make an empty local pass safe.
+		localSafetyAbort = shouldAbortResyncSwap(
+			localStats, localOldFileSessions, 0,
+		)
+	}
+	abortSwap := localSafetyAbort ||
+		shouldAbortResyncSwap(stats, rebuildOldFileSessions, trashedCopied)
 	if abortSwap {
 		log.Printf(
 			"resync: aborting swap, %d synced / %d failed / %d total",
@@ -1424,7 +1605,10 @@ func (e *Engine) resyncAllLocked(
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
-		return stats
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+		return stats, nil
 	}
 
 	// 4. Close origDB connections first to quiesce writes,
@@ -1453,7 +1637,7 @@ func (e *Engine) resyncAllLocked(
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
-		return stats
+		return stats, err
 	}
 
 	// Re-copy excluded session IDs now that origDB is quiesced.
@@ -1487,7 +1671,7 @@ func (e *Engine) resyncAllLocked(
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
-		return stats
+		return stats, err
 	}
 
 	// Copy insights into newDB from the quiesced old DB file.
@@ -1513,7 +1697,7 @@ func (e *Engine) resyncAllLocked(
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
-		return stats
+		return stats, err
 	}
 	log.Printf(
 		"resync: copy insights: %s",
@@ -1564,7 +1748,7 @@ func (e *Engine) resyncAllLocked(
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
-		return stats
+		return stats, err
 	}
 	stats.OrphanedCopied = orphaned
 
@@ -1601,7 +1785,7 @@ func (e *Engine) resyncAllLocked(
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
-		return stats
+		return stats, err
 	}
 
 	// Merge user-managed data and immutable project-identity snapshots from the
@@ -1629,7 +1813,7 @@ func (e *Engine) resyncAllLocked(
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
-		return stats
+		return stats, err
 	}
 	if _, err := newDB.ApplyWorktreeProjectMappingsFromSync(
 		context.Background(), e.machine,
@@ -1660,7 +1844,7 @@ func (e *Engine) resyncAllLocked(
 			"Rebuilding search index",
 			"Rebuilding the search index may take a while on large archives.",
 		)
-		if err := newDB.RebuildFTS(); err != nil {
+		if err := ops.rebuildFTS(newDB); err != nil {
 			log.Printf("resync: rebuild fts: %v", err)
 			stats.Aborted = true
 			stats.Warnings = append(stats.Warnings,
@@ -1676,7 +1860,7 @@ func (e *Engine) resyncAllLocked(
 			e.mu.Lock()
 			e.lastSyncStats = stats
 			e.mu.Unlock()
-			return stats
+			return stats, err
 		}
 		log.Printf(
 			"resync: rebuild fts: %s",
@@ -1709,15 +1893,21 @@ func (e *Engine) resyncAllLocked(
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
-		return stats
+		return stats, err
 	}
 	removeWAL(tempPath)
 
-	if err := origDB.Reopen(); err != nil {
+	if err := ops.reopen(origDB); err != nil {
 		log.Printf("resync: reopen db: %v", err)
+		stats.Aborted = true
 		stats.Warnings = append(stats.Warnings,
-			"reopen after resync failed: "+err.Error(),
+			"resync swap completed but reopening active database failed: "+
+				err.Error(),
 		)
+		e.mu.Lock()
+		e.lastSyncStats = stats
+		e.mu.Unlock()
+		return stats, err
 	} else {
 		origDB.MarkDataCurrent()
 		if err := origDB.CheckpointWALTruncateWithRetry(ctx); err != nil {
@@ -1755,10 +1945,20 @@ func removeWAL(path string) {
 }
 
 func (e *Engine) countRootOpenCodeFormatSessions(
-	database *db.DB, agent parser.AgentType,
+	database *db.DB, agent parser.AgentType, machine, idPrefix string, scoped bool,
 ) int {
 	if !isOpenCodeFormatStorageAgent(agent) {
 		return 0
+	}
+	machinePredicate := ""
+	args := []any{string(agent)}
+	if scoped {
+		machinePredicate = " AND machine = ?"
+		args = append(args, machine)
+	}
+	if idPrefix != "" {
+		machinePredicate += " AND substr(id, 1, length(?)) = ?"
+		args = append(args, idPrefix, idPrefix)
 	}
 	var count int
 	err := database.Reader().QueryRow(`
@@ -1767,11 +1967,48 @@ func (e *Engine) countRootOpenCodeFormatSessions(
 		  AND message_count > 0
 		  AND relationship_type NOT IN ('subagent', 'fork')
 		  AND deleted_at IS NULL
-	`, string(agent)).Scan(&count)
+	`+machinePredicate, args...).Scan(&count)
 	if err != nil {
 		log.Printf("count root %s sessions: %v", agent, err)
 	}
 	return count
+}
+
+func (e *Engine) protectedFileSessionCount(
+	database *db.DB, machine, idPrefix string, scoped bool,
+) (int, error) {
+	var count int
+	var err error
+	if scoped {
+		if idPrefix != "" {
+			count, err = database.FileBackedSessionCountForSource(
+				context.Background(), machine, idPrefix,
+			)
+		} else {
+			count, err = database.FileBackedSessionCountForMachine(
+				context.Background(), machine,
+			)
+		}
+	} else {
+		count, err = database.FileBackedSessionCount(context.Background())
+	}
+	if err != nil {
+		return 0, err
+	}
+	for _, agent := range []parser.AgentType{
+		parser.AgentOpenCode,
+		parser.AgentKilo,
+		parser.AgentMiMoCode,
+		parser.AgentIcodemate,
+	} {
+		count -= e.countRootOpenCodeFormatSessions(
+			database, agent, machine, idPrefix, scoped,
+		)
+	}
+	if count < 0 {
+		count = 0
+	}
+	return count, nil
 }
 
 // Sync state keys persisted in pg_sync_state.
@@ -1857,6 +2094,96 @@ func (e *Engine) syncThenRunLocked(
 	// pushed sessions could carry stale signal/secret fields.
 	e.signalSched.flushAllInline()
 	if err := work(full || didResync); err != nil {
+		return stats, err
+	}
+	return stats, nil
+}
+
+// RebuildCleanup owns resources prepared for a multi-source rebuild. Close
+// may be retried when it fails so callers can retain mirror locks and temporary
+// roots instead of silently losing cleanup ownership.
+type RebuildCleanup interface {
+	Close() error
+}
+
+type rebuildCleanupError struct {
+	owner RebuildCleanup
+	err   error
+}
+
+func (e *rebuildCleanupError) Error() string { return e.err.Error() }
+func (e *rebuildCleanupError) Unwrap() error { return e.err }
+func (e *rebuildCleanupError) RetryCleanup() error {
+	return e.owner.Close()
+}
+
+// SyncThenRunWithRebuild coordinates local sync, optional contributor
+// preparation, an atomic multi-source rebuild, and post-rebuild work under the
+// engine's exclusive sync lock. Preparation only runs when a rebuild is
+// required, and work never runs after a failed or aborted rebuild.
+func (e *Engine) SyncThenRunWithRebuild(
+	ctx context.Context,
+	full bool,
+	onProgress ProgressFunc,
+	prepare func() (RebuildOptions, RebuildCleanup, error),
+	work func(forceFull, rebuilt bool) error,
+) (stats SyncStats, retErr error) {
+	if e.refuseWriteInForceParse("SyncThenRunWithRebuild") {
+		return SyncStats{}, nil
+	}
+	e.syncMu.Lock()
+	defer func() {
+		if stats.Synced > 0 && !stats.Aborted {
+			e.emit("sync")
+		}
+	}()
+	defer e.syncMu.Unlock()
+	defer func() {
+		if retErr == nil && !stats.Aborted {
+			// Match SyncThenRun: successful foreground coordination unblocks
+			// startup backfills while syncMu is still held.
+			e.ReleaseStartupMaintenance()
+		}
+	}()
+	defer e.clearCurrentProgress()
+
+	didResync := full || e.db.NeedsResync()
+	if didResync {
+		opts, cleanup, err := prepare()
+		if cleanup != nil {
+			defer func() {
+				if err := cleanup.Close(); err != nil {
+					retErr = errors.Join(retErr, &rebuildCleanupError{
+						owner: cleanup,
+						err:   err,
+					})
+				}
+			}()
+		}
+		if err != nil {
+			return SyncStats{}, err
+		}
+		opts.includePhaseDiagnostics = true
+		stats, err = e.resyncAllWithOptionsLocked(
+			ctx, onProgress, opts, productionRebuildOperations,
+		)
+		if err != nil {
+			return stats, err
+		}
+		if stats.Aborted {
+			return stats, nil
+		}
+	} else {
+		stats = e.syncAllLocked(
+			ctx, onProgress, time.Time{}, nil,
+			syncWriteDefault, true, false,
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
+	e.signalSched.flushAllInline()
+	if err := work(full || didResync, didResync); err != nil {
 		return stats, err
 	}
 	return stats, nil
@@ -4676,17 +5003,16 @@ func providerProcessCacheKeyWithHash(
 
 func providerFingerprintHashInCacheKey(agent parser.AgentType) bool {
 	switch agent {
-	case parser.AgentDevin, parser.AgentQoder, parser.AgentWindsurf:
+	case parser.AgentClaude, parser.AgentCodex, parser.AgentDevin, parser.AgentQoder, parser.AgentWindsurf:
 		return true
 	default:
 		return false
 	}
 }
 
-// providerFingerprintHashRequiredForFreshness is deliberately broader than
-// providerFingerprintHashInCacheKey. Codex hashes every transcript to verify a
-// same-stat rewrite against the persisted row, but retaining one skip-cache key
-// per content version would make the cache grow with a hot append-only file.
+// providerFingerprintHashRequiredForFreshness also protects stored rows. Hash
+// cache keys protect rowless parser exclusions and failures; cacheSkip removes
+// older hash siblings so hot append-only files retain only one content version.
 func providerFingerprintHashRequiredForFreshness(agent parser.AgentType) bool {
 	switch agent {
 	case parser.AgentClaude, parser.AgentCodex, parser.AgentDevin, parser.AgentQoder, parser.AgentWindsurf:
@@ -4712,14 +5038,16 @@ func (e *Engine) providerSkipCacheEntryFreshInDB(
 	if e.pathRewriter != nil {
 		lookupPath = e.pathRewriter(lookupPath)
 	}
-	if agent == parser.AgentCodex {
+	if agent == parser.AgentClaude || agent == parser.AgentCodex {
 		storedIDs, err := e.db.ListSessionIDsByFilePath(
-			lookupPath, string(parser.AgentCodex),
+			lookupPath, string(agent),
 		)
 		if err == nil && len(storedIDs) == 0 {
-			// A cached parse failure has no persisted source row or hash to
-			// compare. Retain its retry suppression until a source signal changes;
-			// hash validation applies once a session has actually been stored.
+			// A cached parse failure or intentionally ignored source has no
+			// persisted row or hash to compare. Retry suppression is therefore
+			// mtime/source-signal based until a row exists: a same-mtime rewrite
+			// cannot be distinguished in this no-row state. Hash validation applies
+			// once a session has actually been stored.
 			return true
 		}
 	}
@@ -4882,11 +5210,64 @@ func (e *Engine) shouldCacheSkip(
 	return true
 }
 
-// cacheSkip records a file so it won't be retried until
-// its mtime changes.
-func (e *Engine) cacheSkip(path string, mtime int64, sourceFingerprint ...string) {
+const sourceHashSkipMarker = "?source_hash="
+
+// normalizeSourceHashSkipCache performs the one archive-sized pass needed to
+// repair legacy duplicate source-hash entries and build the watcher-time
+// sibling index. A family with multiple hashed keys is ambiguous: same-mtime
+// rewrites are why the hash exists, so no stored key can safely be called
+// current. Drop that family so the source reparses once and establishes a
+// trustworthy key.
+func normalizeSourceHashSkipCache(
+	cache map[string]int64, fingerprints map[string]string,
+) (map[string]string, map[string]struct{}) {
+	index := make(map[string]string)
+	counts := make(map[string]int)
+	ambiguous := make(map[string]struct{})
+	for path := range cache {
+		base, _, hashed := strings.Cut(path, sourceHashSkipMarker)
+		if !hashed {
+			continue
+		}
+		counts[base]++
+		if counts[base] == 1 {
+			index[base] = path
+		}
+	}
+	for path := range cache {
+		base, _, hashed := strings.Cut(path, sourceHashSkipMarker)
+		if hashed && counts[base] > 1 {
+			delete(cache, path)
+			ambiguous[base] = struct{}{}
+			if fingerprints != nil {
+				delete(fingerprints, path)
+			}
+		}
+	}
+	for base := range index {
+		delete(cache, base)
+		if fingerprints != nil {
+			delete(fingerprints, base)
+		}
+		if counts[base] > 1 {
+			delete(index, base)
+		}
+	}
+	return index, ambiguous
+}
+
+// cacheSkip records a file so it won't be retried until its mtime changes.
+// The returned work count measures sibling-index probes and is used by the
+// cardinality regression to keep watcher-time work independent of cache size.
+func (e *Engine) cacheSkip(
+	path string, mtime int64, sourceFingerprint ...string,
+) int {
 	e.skipMu.Lock()
+	work := e.removeSkipHashSiblingsLocked(path)
 	e.skipCache[path] = mtime
+	if base, _, hashed := strings.Cut(path, sourceHashSkipMarker); hashed {
+		e.skipHashKeys[base] = path
+	}
 	fingerprint := ""
 	if len(sourceFingerprint) > 0 {
 		fingerprint = sourceFingerprint[0]
@@ -4900,16 +5281,44 @@ func (e *Engine) cacheSkip(path string, mtime int64, sourceFingerprint ...string
 		delete(e.skipFingerprints, path)
 	}
 	e.skipMu.Unlock()
+	return work
 }
 
-// clearSkip removes a skip-cache entry when a file
-// produces a valid session.
-func (e *Engine) clearSkip(path string) {
+// clearSkip removes a skip-cache entry when a file produces a valid session.
+// Its work count has the same cardinality-regression role as cacheSkip's.
+func (e *Engine) clearSkip(path string) int {
 	e.skipMu.Lock()
+	work := e.removeSkipHashSiblingsLocked(path)
 	delete(e.skipCache, path)
 	delete(e.skipFingerprints, path)
 	e.skipMu.Unlock()
 	_ = e.db.DeleteSkippedFile(path)
+	return work
+}
+
+func (e *Engine) removeSkipHashSiblingsLocked(path string) int {
+	if e.skipHashKeys == nil {
+		e.skipHashKeys, _ = normalizeSourceHashSkipCache(
+			e.skipCache, e.skipFingerprints,
+		)
+	}
+	base, _, hasHash := strings.Cut(path, sourceHashSkipMarker)
+	if !hasHash {
+		if sibling, ok := e.skipHashKeys[path]; ok {
+			delete(e.skipCache, sibling)
+			delete(e.skipFingerprints, sibling)
+			delete(e.skipHashKeys, path)
+		}
+		return 1
+	}
+	delete(e.skipCache, base)
+	delete(e.skipFingerprints, base)
+	if sibling, ok := e.skipHashKeys[base]; ok {
+		delete(e.skipCache, sibling)
+		delete(e.skipFingerprints, sibling)
+		delete(e.skipHashKeys, base)
+	}
+	return 2
 }
 
 // clearWatcherOverflowCaches invalidates every freshness shortcut whose
@@ -4919,6 +5328,7 @@ func (e *Engine) clearWatcherOverflowCaches() {
 	e.skipMu.Lock()
 	e.skipCache = make(map[string]int64)
 	e.skipFingerprints = make(map[string]string)
+	e.skipHashKeys = make(map[string]string)
 	e.skipMu.Unlock()
 	if !e.ephemeral {
 		if err := e.db.ReplaceSkippedFiles(map[string]int64{}); err != nil {
@@ -4937,7 +5347,24 @@ func (e *Engine) clearWatcherOverflowCaches() {
 func (e *Engine) InjectSkipCache(entries map[string]int64) {
 	e.skipMu.Lock()
 	defer e.skipMu.Unlock()
-	maps.Copy(e.skipCache, entries)
+	if e.skipHashKeys == nil {
+		e.skipHashKeys, _ = normalizeSourceHashSkipCache(
+			e.skipCache, e.skipFingerprints,
+		)
+	}
+	incoming := make(map[string]int64, len(entries))
+	maps.Copy(incoming, entries)
+	_, ambiguous := normalizeSourceHashSkipCache(incoming, nil)
+	for base := range ambiguous {
+		e.removeSkipHashSiblingsLocked(base + sourceHashSkipMarker)
+	}
+	for path, mtime := range incoming {
+		e.removeSkipHashSiblingsLocked(path)
+		e.skipCache[path] = mtime
+		if base, _, hashed := strings.Cut(path, sourceHashSkipMarker); hashed {
+			e.skipHashKeys[base] = path
+		}
+	}
 }
 
 // SnapshotSkipCache returns a copy of the in-memory skip

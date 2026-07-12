@@ -12,7 +12,20 @@ description: Release history for AgentsView
   IDE sessions, falling back to the existing heuristic decode when a sidecar is
   missing, malformed, or does not cover the session's database steps.
 
+**Improvements**
+
+- Speed up configured HTTP **full remote syncs** by ingesting local and remote
+  sessions through one batched temporary-database rebuild with FTS suspended,
+  then rebuilding search once and swapping atomically. `--full` now reparses
+  every session without retransferring unchanged mirror files from
+  manifest-capable spokes; older HTTP-capable spokes retain the full-archive
+  compatibility fallback.
+
 **Bug fixes**
+
+- Identify locally ingested sessions by the machine's hostname instead of the
+  ambiguous `local` label, and keep full-rebuild safety independent when a
+  configured remote has the same hostname as the collector.
 
 - Remove **recommended-plugin context injected into Codex sessions** from
   parsed transcripts so it no longer appears as user-authored content.
