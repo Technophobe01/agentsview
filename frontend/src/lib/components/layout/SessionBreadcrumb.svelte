@@ -272,6 +272,10 @@
       : "",
   );
 
+  let resumeModel = $derived(
+    session ? messagesStore.resumeModelFor(session.id) : "",
+  );
+
   const gradeStyle = $derived(
     getGradeStyle(session?.health_grade),
   );
@@ -427,7 +431,9 @@
     } catch {
       // Fall back to local command build.
     }
-    const cmd = buildResumeCommand(session.agent, session.id);
+    const cmd = buildResumeCommand(session.agent, session.id, {
+      model: resumeModel,
+    });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
       showFeedback(ok
@@ -459,7 +465,9 @@
     } catch {
       // Fall back to local build.
     }
-    const cmd = buildResumeCommand(session.agent, session.id);
+    const cmd = buildResumeCommand(session.agent, session.id, {
+      model: resumeModel,
+    });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
       showFeedback(ok
@@ -528,7 +536,9 @@
     } catch {
       // Fall back to local command build.
     }
-    const cmd = buildResumeCommand(session.agent, session.id);
+    const cmd = buildResumeCommand(session.agent, session.id, {
+      model: resumeModel,
+    });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
       showFeedback(ok

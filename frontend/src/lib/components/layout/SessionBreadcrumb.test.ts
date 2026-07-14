@@ -1,24 +1,15 @@
 // @vitest-environment jsdom
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-  afterEach,
-} from "vite-plus/test";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import { mount, unmount, tick } from "svelte";
 import { createClassComponent } from "svelte/legacy";
 // @ts-ignore
 import SessionBreadcrumb from "./SessionBreadcrumb.svelte";
 import type { Message, Session } from "../../api/types.js";
-import {
-  OpenersService,
-  SessionsService,
-} from "../../api/generated/index";
+import { OpenersService, SessionsService } from "../../api/generated/index";
 import { messages } from "../../stores/messages.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 import { router } from "../../stores/router.svelte.js";
+import { copyToClipboard } from "../../utils/clipboard.js";
 
 const { generateForSession } = vi.hoisted(() => ({
   generateForSession: vi.fn(),
@@ -32,9 +23,7 @@ vi.mock("../../stores/insights.svelte.js", () => ({
 
 vi.mock("../../api/client.js", () => ({
   listOpeners: vi.fn().mockResolvedValue({ openers: [] }),
-  getSessionDirectory: vi
-    .fn()
-    .mockResolvedValue({ path: "" }),
+  getSessionDirectory: vi.fn().mockResolvedValue({ path: "" }),
   resumeSession: vi.fn(),
   openSession: vi.fn(),
 }));
@@ -44,8 +33,7 @@ vi.mock("../../utils/clipboard.js", () => ({
 }));
 
 vi.mock("../../api/generated/index", async (importOriginal) => {
-  const orig =
-    await importOriginal<typeof import("../../api/generated/index")>();
+  const orig = await importOriginal<typeof import("../../api/generated/index")>();
   return {
     ...orig,
     OpenersService: {
@@ -128,9 +116,7 @@ interface SessionUsageBreakdownEntry {
   has_cost: boolean;
 }
 
-function makeUsage(
-  overrides: Partial<SessionUsage> = {},
-): SessionUsage {
+function makeUsage(overrides: Partial<SessionUsage> = {}): SessionUsage {
   return {
     session_id: "run:123456789abcdef",
     agent: "claude",
@@ -150,9 +136,7 @@ function makeUsage(
 }
 
 async function openUsageBreakdown(): Promise<void> {
-  const details = document.querySelector<HTMLDetailsElement>(
-    ".usage-breakdown",
-  );
+  const details = document.querySelector<HTMLDetailsElement>(".usage-breakdown");
   expect(details).not.toBeNull();
   details!.open = true;
   details!.dispatchEvent(new Event("toggle"));
@@ -199,15 +183,9 @@ async function flushPromises() {
 
 beforeEach(() => {
   generateForSession.mockReset();
-  openersService.getApiV1Openers
-    .mockReset()
-    .mockResolvedValue({ openers: [] });
-  sessionsService.getApiV1SessionsIdDirectory
-    .mockReset()
-    .mockResolvedValue({ path: "" });
-  sessionsService.getApiV1SessionsIdUsage
-    .mockReset()
-    .mockResolvedValue(makeUsage());
+  openersService.getApiV1Openers.mockReset().mockResolvedValue({ openers: [] });
+  sessionsService.getApiV1SessionsIdDirectory.mockReset().mockResolvedValue({ path: "" });
+  sessionsService.getApiV1SessionsIdUsage.mockReset().mockResolvedValue(makeUsage());
   sessionsService.postApiV1SessionsIdResume.mockReset();
 });
 
@@ -248,30 +226,20 @@ describe("SessionBreadcrumb", () => {
     });
     await tick();
 
-    const backButton = document.querySelector<HTMLButtonElement>(
-      ".breadcrumb-link",
-    );
+    const backButton = document.querySelector<HTMLButtonElement>(".breadcrumb-link");
     expect(backButton?.textContent?.trim()).toBe("会话");
     expect(backButton?.getAttribute("title")).toBe("返回会话列表");
 
-    const linkButton = document.querySelector<HTMLButtonElement>(
-      ".link-btn",
-    );
+    const linkButton = document.querySelector<HTMLButtonElement>(".link-btn");
     expect(linkButton?.getAttribute("aria-label")).toBe("复制会话链接");
     expect(linkButton?.getAttribute("title")).toBe("复制会话链接");
 
-    const findButton = document.querySelector<HTMLButtonElement>(
-      ".find-btn",
-    );
+    const findButton = document.querySelector<HTMLButtonElement>(".find-btn");
     expect(findButton?.getAttribute("aria-label")).toBe("在会话中查找");
     expect(findButton?.getAttribute("title")).toBe("在会话中查找 (/)");
 
-    const resumeButton = document.querySelector<HTMLButtonElement>(
-      ".resume-btn",
-    );
-    expect(resumeButton?.textContent?.replace(/\s+/g, " ").trim()).toBe(
-      "继续",
-    );
+    const resumeButton = document.querySelector<HTMLButtonElement>(".resume-btn");
+    expect(resumeButton?.textContent?.replace(/\s+/g, " ").trim()).toBe("继续");
     resumeButton?.click();
     await tick();
 
@@ -281,9 +249,7 @@ describe("SessionBreadcrumb", () => {
     expect(document.body.textContent).toContain("打开方式");
     expect(document.body.textContent).toContain("VS Code");
 
-    const actionsButton = document.querySelector<HTMLButtonElement>(
-      ".actions-btn",
-    );
+    const actionsButton = document.querySelector<HTMLButtonElement>(".actions-btn");
     expect(actionsButton?.getAttribute("aria-label")).toBe("会话操作");
     actionsButton?.click();
     await tick();
@@ -319,9 +285,7 @@ describe("SessionBreadcrumb", () => {
     document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
     await tick();
 
-    const resumeItem = document.querySelector<HTMLButtonElement>(
-      ".open-menu-item",
-    );
+    const resumeItem = document.querySelector<HTMLButtonElement>(".open-menu-item");
     expect(resumeItem).toBeTruthy();
     resumeItem!.click();
     await Promise.resolve();
@@ -333,6 +297,289 @@ describe("SessionBreadcrumb", () => {
     });
 
     unmount(component);
+  });
+
+  it("keeps the backend default resume command authoritative when a local model exists", async () => {
+    vi.mocked(copyToClipboard).mockClear();
+    messages.sessionId = "run:123456789abcdef";
+    messages.messages = [makeAssistantMessage("claude sonnet")];
+    messages.historyComplete = true;
+    sessionsService.postApiV1SessionsIdResume.mockResolvedValue({
+      launched: false,
+      command: "claude --resume run:123456789abcdef",
+      cwd: "/tmp/project",
+    });
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude", {
+          file_path: "/tmp/project/session.jsonl",
+        }),
+        onBack: () => {},
+      },
+    });
+
+    await tick();
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+    const defaultTerminal = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".open-menu-item"),
+    ).find((button) => button.textContent?.includes("Default terminal"));
+    defaultTerminal?.click();
+    await vi.waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith("claude --resume run:123456789abcdef");
+    });
+
+    unmount(component);
+    messages.clear();
+  });
+
+  it("pins the active model when the backend resume request fails", async () => {
+    vi.mocked(copyToClipboard).mockClear();
+    messages.sessionId = "run:123456789abcdef";
+    messages.messages = [makeAssistantMessage("claude sonnet")];
+    messages.historyComplete = true;
+    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+
+    await tick();
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+    const defaultTerminal = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".open-menu-item"),
+    ).find((button) => button.textContent?.includes("Default terminal"));
+    defaultTerminal?.click();
+    await vi.waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith(
+        "claude --resume 'run:123456789abcdef' --model 'claude sonnet'",
+      );
+    });
+
+    unmount(component);
+    messages.clear();
+  });
+
+  it("does not pin a partial-history model when older messages remain unloaded", async () => {
+    vi.mocked(copyToClipboard).mockClear();
+    messages.sessionId = "run:123456789abcdef";
+    messages.messages = [makeAssistantMessage("claude sonnet")];
+    messages.historyComplete = false;
+    messages.hasOlder = true;
+    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude", { message_count: 3001 }),
+        onBack: () => {},
+      },
+    });
+
+    await tick();
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+    const defaultTerminal = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".open-menu-item"),
+    ).find((button) => button.textContent?.includes("Default terminal"));
+    defaultTerminal?.click();
+    await vi.waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith("claude --resume 'run:123456789abcdef'");
+    });
+    expect(document.querySelector(".model-badge")?.textContent).toBe("claude sonnet");
+
+    unmount(component);
+    messages.clear();
+  });
+
+  it("does not pin a reloading stable model in the resume fallback", async () => {
+    vi.mocked(copyToClipboard).mockClear();
+    messages.sessionId = "run:123456789abcdef";
+    messages.loading = true;
+    (messages as any)._stableMainModel = "claude sonnet";
+    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude", { message_count: 3001 }),
+        onBack: () => {},
+      },
+    });
+
+    await tick();
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+    const defaultTerminal = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".open-menu-item"),
+    ).find((button) => button.textContent?.includes("Default terminal"));
+    defaultTerminal?.click();
+    await vi.waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith("claude --resume 'run:123456789abcdef'");
+    });
+    expect(document.querySelector(".model-badge")?.textContent).toBe("claude sonnet");
+
+    unmount(component);
+    messages.clear();
+  });
+
+  it("pins the active model when handleResumeIn falls back locally", async () => {
+    vi.mocked(copyToClipboard).mockClear();
+    messages.sessionId = "run:123456789abcdef";
+    messages.messages = [makeAssistantMessage("claude sonnet")];
+    messages.historyComplete = true;
+    openersService.getApiV1Openers.mockResolvedValue({
+      openers: [
+        {
+          id: "test-terminal",
+          name: "Test Terminal",
+          kind: "terminal",
+          bin: "wt.exe",
+        },
+      ],
+    });
+    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector(".resume-btn")).toBeTruthy();
+    });
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+    const opener = Array.from(document.querySelectorAll<HTMLButtonElement>(".open-menu-item")).find(
+      (button) => button.textContent?.includes("Test Terminal"),
+    );
+    opener?.click();
+    await vi.waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith(
+        "claude --resume 'run:123456789abcdef' --model 'claude sonnet'",
+      );
+    });
+
+    unmount(component);
+    messages.clear();
+  });
+
+  it("keeps backend opener commands authoritative when a local model exists", async () => {
+    vi.mocked(copyToClipboard).mockClear();
+    messages.sessionId = "run:123456789abcdef";
+    messages.messages = [makeAssistantMessage("claude sonnet")];
+    openersService.getApiV1Openers.mockResolvedValue({
+      openers: [
+        {
+          id: "test-terminal",
+          name: "Test Terminal",
+          kind: "terminal",
+          bin: "wt.exe",
+        },
+      ],
+    });
+    sessionsService.postApiV1SessionsIdResume.mockResolvedValue({
+      launched: false,
+      command: "claude --resume run:123456789abcdef",
+      cwd: "/tmp/project",
+    });
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+
+    await tick();
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+    const opener = Array.from(document.querySelectorAll<HTMLButtonElement>(".open-menu-item")).find(
+      (button) => button.textContent?.includes("Test Terminal"),
+    );
+    opener?.click();
+    await vi.waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith("claude --resume run:123456789abcdef");
+    });
+
+    unmount(component);
+    messages.clear();
+  });
+
+  it("pins the active model when handleCopyResumeCommand falls back locally", async () => {
+    vi.mocked(copyToClipboard).mockClear();
+    messages.sessionId = "run:123456789abcdef";
+    messages.messages = [makeAssistantMessage("claude sonnet")];
+    messages.historyComplete = true;
+    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+
+    await tick();
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+    const copyCommand = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".open-menu-item"),
+    ).find((button) => button.textContent?.includes("Copy command"));
+    copyCommand?.click();
+    await vi.waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith(
+        "claude --resume 'run:123456789abcdef' --model 'claude sonnet'",
+      );
+    });
+
+    unmount(component);
+    messages.clear();
+  });
+
+  it("keeps backend command-only responses authoritative when a local model exists", async () => {
+    vi.mocked(copyToClipboard).mockClear();
+    messages.sessionId = "run:123456789abcdef";
+    messages.messages = [makeAssistantMessage("claude sonnet")];
+    sessionsService.postApiV1SessionsIdResume.mockResolvedValue({
+      launched: false,
+      command: "claude --resume run:123456789abcdef",
+      cwd: "/tmp/project",
+    });
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+
+    await tick();
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+    const copyCommand = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".open-menu-item"),
+    ).find((button) => button.textContent?.includes("Copy command"));
+    copyCommand?.click();
+    await vi.waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith("claude --resume run:123456789abcdef");
+    });
+
+    unmount(component);
+    messages.clear();
   });
 
   it("offers a Codex Desktop deep link for a local terminal-created session", async () => {
@@ -350,24 +597,16 @@ describe("SessionBreadcrumb", () => {
     document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
     await tick();
 
-    const link = document.querySelector<HTMLAnchorElement>(
-      '[data-testid="codex-desktop-link"]',
-    );
+    const link = document.querySelector<HTMLAnchorElement>('[data-testid="codex-desktop-link"]');
     expect(link).toBeTruthy();
-    expect(link?.getAttribute("href")).toBe(
-      "codex://threads/terminal-session-123",
-    );
+    expect(link?.getAttribute("href")).toBe("codex://threads/terminal-session-123");
     expect(link?.textContent).toContain("Codex Desktop");
 
-    const menuLabels = Array.from(
-      document.querySelectorAll(".open-menu-name"),
-    ).map((node) => node.textContent?.trim());
-    const codexMenuIndex = menuLabels.findIndex((label) =>
-      label?.includes("Codex Desktop"),
+    const menuLabels = Array.from(document.querySelectorAll(".open-menu-name")).map((node) =>
+      node.textContent?.trim(),
     );
-    expect(codexMenuIndex).toBeLessThan(
-      menuLabels.indexOf("Copy command"),
-    );
+    const codexMenuIndex = menuLabels.findIndex((label) => label?.includes("Codex Desktop"));
+    expect(codexMenuIndex).toBeLessThan(menuLabels.indexOf("Copy command"));
 
     await unmount(component);
   });
@@ -384,12 +623,8 @@ describe("SessionBreadcrumb", () => {
     await tick();
     const badge = document.querySelector(".agent-badge");
     expect(badge).toBeTruthy();
-    expect(badge?.getAttribute("style")).toContain(
-      "var(--accent-rose)",
-    );
-    expect(badge?.getAttribute("style")).toContain(
-      "var(--accent-rose-foreground)",
-    );
+    expect(badge?.getAttribute("style")).toContain("var(--accent-rose)");
+    expect(badge?.getAttribute("style")).toContain("var(--accent-rose-foreground)");
 
     unmount(component);
   });
@@ -413,12 +648,10 @@ describe("SessionBreadcrumb", () => {
 
     await vi.waitFor(() => {
       expect(
-        document.querySelector<HTMLAnchorElement>(
-          '[data-testid="claude-code-link"]',
-        )?.getAttribute("href"),
-      ).toBe(
-        "claude://code/new?folder=%2Ftmp%2Fclaude%20project",
-      );
+        document
+          .querySelector<HTMLAnchorElement>('[data-testid="claude-code-link"]')
+          ?.getAttribute("href"),
+      ).toBe("claude://code/new?folder=%2Ftmp%2Fclaude%20project");
     });
 
     await unmount(component);
@@ -435,12 +668,8 @@ describe("SessionBreadcrumb", () => {
 
     await tick();
     const badge = document.querySelector(".agent-badge");
-    expect(badge?.getAttribute("style")).toContain(
-      "var(--accent-blue)",
-    );
-    expect(badge?.getAttribute("style")).toContain(
-      "var(--accent-blue-foreground)",
-    );
+    expect(badge?.getAttribute("style")).toContain("var(--accent-blue)");
+    expect(badge?.getAttribute("style")).toContain("var(--accent-blue-foreground)");
 
     unmount(component);
   });
@@ -468,21 +697,15 @@ describe("SessionBreadcrumb", () => {
       expect(linkBtn).toBeTruthy();
 
       // First copy
-      linkBtn!.dispatchEvent(
-        new MouseEvent("click", { bubbles: true }),
-      );
+      linkBtn!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await tick();
       await vi.advanceTimersByTimeAsync(0);
       await tick();
-      expect(
-        linkBtn!.classList.contains("link-btn--copied"),
-      ).toBe(true);
+      expect(linkBtn!.classList.contains("link-btn--copied")).toBe(true);
 
       // Advance 1s, then copy again
       await vi.advanceTimersByTimeAsync(1000);
-      linkBtn!.dispatchEvent(
-        new MouseEvent("click", { bubbles: true }),
-      );
+      linkBtn!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await tick();
       await vi.advanceTimersByTimeAsync(0);
       await tick();
@@ -491,16 +714,12 @@ describe("SessionBreadcrumb", () => {
       // would have expired, but it was cleared
       await vi.advanceTimersByTimeAsync(600);
       await tick();
-      expect(
-        linkBtn!.classList.contains("link-btn--copied"),
-      ).toBe(true);
+      expect(linkBtn!.classList.contains("link-btn--copied")).toBe(true);
 
       // After full 1.5s from second click, state clears
       await vi.advanceTimersByTimeAsync(900);
       await tick();
-      expect(
-        linkBtn!.classList.contains("link-btn--copied"),
-      ).toBe(false);
+      expect(linkBtn!.classList.contains("link-btn--copied")).toBe(false);
 
       unmount(component);
     });
@@ -522,9 +741,7 @@ describe("SessionBreadcrumb", () => {
 
     await tick();
     const tokenBadge = document.querySelector(".token-badge");
-    expect(tokenBadge?.textContent?.replace(/\s+/g, " ").trim()).toBe(
-      "2.4k ctx / 180 out",
-    );
+    expect(tokenBadge?.textContent?.replace(/\s+/g, " ").trim()).toBe("2.4k ctx / 180 out");
 
     unmount(component);
   });
@@ -569,9 +786,7 @@ describe("SessionBreadcrumb", () => {
 
     await tick();
     const tokenBadge = document.querySelector(".token-badge");
-    expect(tokenBadge?.textContent?.replace(/\s+/g, " ").trim()).toBe(
-      "— ctx / 180 out",
-    );
+    expect(tokenBadge?.textContent?.replace(/\s+/g, " ").trim()).toBe("— ctx / 180 out");
 
     unmount(component);
   });
@@ -592,12 +807,8 @@ describe("SessionBreadcrumb", () => {
 
     await tick();
 
-    const mobileTokenBadge = document.querySelector(
-      ".token-badge--mobile",
-    );
-    expect(
-      mobileTokenBadge?.textContent?.replace(/\s+/g, " ").trim(),
-    ).toBe("2.4k ctx / 180 out");
+    const mobileTokenBadge = document.querySelector(".token-badge--mobile");
+    expect(mobileTokenBadge?.textContent?.replace(/\s+/g, " ").trim()).toBe("2.4k ctx / 180 out");
 
     unmount(component);
   });
@@ -666,9 +877,7 @@ describe("SessionBreadcrumb", () => {
       const badge = document.querySelector(".malformed-badge");
       expect(badge).toBeTruthy();
       expect(badge?.textContent?.trim()).toBe("3 malformed lines");
-      expect(badge?.getAttribute("title")).toBe(
-        "3 lines in the source file could not be parsed",
-      );
+      expect(badge?.getAttribute("title")).toBe("3 lines in the source file could not be parsed");
       unmount(component);
     });
 
@@ -685,9 +894,7 @@ describe("SessionBreadcrumb", () => {
       await tick();
       const badge = document.querySelector(".malformed-badge");
       expect(badge?.textContent?.trim()).toBe("1 malformed line");
-      expect(badge?.getAttribute("title")).toBe(
-        "1 line in the source file could not be parsed",
-      );
+      expect(badge?.getAttribute("title")).toBe("1 line in the source file could not be parsed");
       unmount(component);
     });
 
@@ -734,9 +941,7 @@ describe("SessionBreadcrumb", () => {
       await tick();
       const badge = document.querySelector(".decode-badge");
       expect(badge).toBeTruthy();
-      expect(badge?.textContent?.trim().toLowerCase()).toContain(
-        "unverified schema",
-      );
+      expect(badge?.textContent?.trim().toLowerCase()).toContain("unverified schema");
       unmount(component);
     });
 
@@ -881,12 +1086,8 @@ describe("SessionBreadcrumb", () => {
       const mobileTokenIdx = children.findIndex((el) =>
         el.classList.contains("token-badge--mobile"),
       );
-      const costIdx = children.findIndex((el) =>
-        el.classList.contains("cost-badge"),
-      );
-      const modelIdx = children.findIndex((el) =>
-        el.classList.contains("model-badge"),
-      );
+      const costIdx = children.findIndex((el) => el.classList.contains("cost-badge"));
+      const modelIdx = children.findIndex((el) => el.classList.contains("model-badge"));
 
       expect(desktopTokenIdx).toBeGreaterThanOrEqual(0);
       expect(mobileTokenIdx).toBeGreaterThan(desktopTokenIdx);
@@ -911,9 +1112,7 @@ describe("SessionBreadcrumb", () => {
 
       await flushPromises();
       await vi.waitFor(() => {
-        expect(
-          sessionsService.getApiV1SessionsIdUsage,
-        ).toHaveBeenCalled();
+        expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalled();
       });
       await flushPromises();
       expect(document.querySelector(".cost-badge")).toBeNull();
@@ -922,9 +1121,7 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("renders no cost badge when the usage request fails", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockRejectedValue(
-        new Error("boom"),
-      );
+      sessionsService.getApiV1SessionsIdUsage.mockRejectedValue(new Error("boom"));
 
       const component = mount(SessionBreadcrumb, {
         target: document.body,
@@ -936,9 +1133,7 @@ describe("SessionBreadcrumb", () => {
 
       await flushPromises();
       await vi.waitFor(() => {
-        expect(
-          sessionsService.getApiV1SessionsIdUsage,
-        ).toHaveBeenCalled();
+        expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalled();
       });
       await flushPromises();
       expect(document.querySelector(".cost-badge")).toBeNull();
@@ -1002,32 +1197,22 @@ describe("SessionBreadcrumb", () => {
       });
 
       await vi.waitFor(() => {
-        expect(
-          document.querySelector(".usage-breakdown-trigger")
-            ?.textContent
-            ?.trim(),
-        ).toBe("2 steps");
+        expect(document.querySelector(".usage-breakdown-trigger")?.textContent?.trim()).toBe(
+          "2 steps",
+        );
       });
-      expect(
-        document.querySelectorAll(".usage-breakdown-row"),
-      ).toHaveLength(0);
-      expect(
-        sessionsService.getApiV1SessionsIdUsage,
-      ).toHaveBeenCalledTimes(1);
-      expect(
-        sessionsService.getApiV1SessionsIdUsage,
-      ).toHaveBeenCalledWith({ id: "run:123456789abcdef" });
+      expect(document.querySelectorAll(".usage-breakdown-row")).toHaveLength(0);
+      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(1);
+      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledWith({
+        id: "run:123456789abcdef",
+      });
 
       await openUsageBreakdown();
-      expect(
-        sessionsService.getApiV1SessionsIdUsage,
-      ).toHaveBeenCalledWith({
+      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledWith({
         id: "run:123456789abcdef",
         breakdown: true,
       });
-      const renderedRows = Array.from(
-        document.querySelectorAll(".usage-breakdown-row"),
-      );
+      const renderedRows = Array.from(document.querySelectorAll(".usage-breakdown-row"));
       expect(renderedRows).toHaveLength(2);
       const first = renderedRows[0]!;
       const second = renderedRows[1]!;
@@ -1042,9 +1227,7 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("renders no usage breakdown when the usage response counts no rows", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
-        makeUsage({ breakdown_count: 0 }),
-      );
+      sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(makeUsage({ breakdown_count: 0 }));
 
       const component = mount(SessionBreadcrumb, {
         target: document.body,
@@ -1056,9 +1239,7 @@ describe("SessionBreadcrumb", () => {
 
       await flushPromises();
       await vi.waitFor(() => {
-        expect(
-          sessionsService.getApiV1SessionsIdUsage,
-        ).toHaveBeenCalled();
+        expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalled();
       });
       expect(document.querySelector(".usage-breakdown")).toBeNull();
 
@@ -1099,16 +1280,12 @@ describe("SessionBreadcrumb", () => {
       });
 
       await vi.waitFor(() => {
-        expect(
-          document.querySelector(".usage-breakdown-trigger")
-            ?.textContent
-            ?.trim(),
-        ).toBe("8 steps");
+        expect(document.querySelector(".usage-breakdown-trigger")?.textContent?.trim()).toBe(
+          "8 steps",
+        );
       });
       await openUsageBreakdown();
-      expect(
-        document.querySelectorAll(".usage-breakdown-row"),
-      ).toHaveLength(8);
+      expect(document.querySelectorAll(".usage-breakdown-row")).toHaveLength(8);
 
       unmount(component);
     });
@@ -1117,9 +1294,7 @@ describe("SessionBreadcrumb", () => {
       const rowsFetch = deferred<SessionUsage>();
       sessionsService.getApiV1SessionsIdUsage.mockImplementation(
         ({ breakdown }: { id: string; breakdown?: boolean }) =>
-          breakdown
-            ? rowsFetch.promise
-            : Promise.resolve(makeUsage({ breakdown_count: 1 })),
+          breakdown ? rowsFetch.promise : Promise.resolve(makeUsage({ breakdown_count: 1 })),
       );
 
       const component = mount(SessionBreadcrumb, {
@@ -1131,21 +1306,15 @@ describe("SessionBreadcrumb", () => {
       });
 
       await vi.waitFor(() => {
-        expect(
-          document.querySelector(".usage-breakdown-trigger")
-            ?.textContent
-            ?.trim(),
-        ).toBe("1 step");
+        expect(document.querySelector(".usage-breakdown-trigger")?.textContent?.trim()).toBe(
+          "1 step",
+        );
       });
       await openUsageBreakdown();
-      expect(
-        document.querySelector(".usage-breakdown-status")
-          ?.textContent
-          ?.trim(),
-      ).toBe("Loading usage...");
-      expect(
-        document.querySelectorAll(".usage-breakdown-row"),
-      ).toHaveLength(0);
+      expect(document.querySelector(".usage-breakdown-status")?.textContent?.trim()).toBe(
+        "Loading usage...",
+      );
+      expect(document.querySelectorAll(".usage-breakdown-row")).toHaveLength(0);
 
       rowsFetch.resolve(
         makeUsage({
@@ -1169,9 +1338,7 @@ describe("SessionBreadcrumb", () => {
       );
       await flushPromises();
       expect(document.querySelector(".usage-breakdown-status")).toBeNull();
-      expect(
-        document.querySelectorAll(".usage-breakdown-row"),
-      ).toHaveLength(1);
+      expect(document.querySelectorAll(".usage-breakdown-row")).toHaveLength(1);
 
       unmount(component);
     });
@@ -1193,21 +1360,13 @@ describe("SessionBreadcrumb", () => {
       });
 
       await vi.waitFor(() => {
-        expect(
-          document.querySelector(".usage-breakdown-trigger")
-            ?.textContent
-            ?.trim(),
-        ).toBe("3 steps");
+        expect(document.querySelector(".usage-breakdown-trigger")?.textContent?.trim()).toBe(
+          "3 steps",
+        );
       });
       await openUsageBreakdown();
-      expect(
-        document.querySelector(".usage-breakdown-status")
-          ?.textContent
-          ?.trim(),
-      ).toBe("Failed");
-      expect(
-        document.querySelectorAll(".usage-breakdown-row"),
-      ).toHaveLength(0);
+      expect(document.querySelector(".usage-breakdown-status")?.textContent?.trim()).toBe("Failed");
+      expect(document.querySelectorAll(".usage-breakdown-row")).toHaveLength(0);
 
       unmount(component);
     });
@@ -1263,9 +1422,7 @@ describe("SessionBreadcrumb", () => {
         expect(badge?.textContent?.trim()).toBe("$2.00");
       });
       await openUsageBreakdown();
-      expect(
-        document.querySelector(".usage-breakdown-row")?.textContent,
-      ).toContain("gpt-5.4");
+      expect(document.querySelector(".usage-breakdown-row")?.textContent).toContain("gpt-5.4");
 
       // The first session's response arrives late and must not
       // overwrite the newer session's cost or step count.
@@ -1278,29 +1435,19 @@ describe("SessionBreadcrumb", () => {
         }),
       );
       await flushPromises();
-      expect(
-        document.querySelector(".cost-badge")?.textContent?.trim(),
-      ).toBe("$2.00");
-      expect(
-        document.querySelector(".usage-breakdown-trigger")
-          ?.textContent
-          ?.trim(),
-      ).toBe("1 step");
-      expect(
-        document.querySelector(".usage-breakdown-row")?.textContent,
-      ).toContain("gpt-5.4");
+      expect(document.querySelector(".cost-badge")?.textContent?.trim()).toBe("$2.00");
+      expect(document.querySelector(".usage-breakdown-trigger")?.textContent?.trim()).toBe(
+        "1 step",
+      );
+      expect(document.querySelector(".usage-breakdown-row")?.textContent).toContain("gpt-5.4");
 
       component.$destroy();
     });
 
     it("refetches when a resync changes context tokens without output movement", async () => {
       sessionsService.getApiV1SessionsIdUsage
-        .mockResolvedValueOnce(
-          makeUsage({ has_cost: true, cost_usd: 1 }),
-        )
-        .mockResolvedValueOnce(
-          makeUsage({ has_cost: true, cost_usd: 1.75 }),
-        );
+        .mockResolvedValueOnce(makeUsage({ has_cost: true, cost_usd: 1 }))
+        .mockResolvedValueOnce(makeUsage({ has_cost: true, cost_usd: 1.75 }));
 
       const component = createClassComponent({
         component: SessionBreadcrumb,
@@ -1324,9 +1471,7 @@ describe("SessionBreadcrumb", () => {
         const badge = document.querySelector(".cost-badge");
         expect(badge?.textContent?.trim()).toBe("$1.75");
       });
-      expect(
-        sessionsService.getApiV1SessionsIdUsage,
-      ).toHaveBeenCalledTimes(2);
+      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(2);
 
       component.$destroy();
     });
@@ -1368,9 +1513,7 @@ describe("SessionBreadcrumb", () => {
         session: makeSession("claude", { id: "run:aaa" }),
       });
       await flushPromises();
-      expect(
-        sessionsService.getApiV1SessionsIdUsage,
-      ).toHaveBeenCalledTimes(3);
+      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(3);
 
       // B's late response must not be shown on A.
       bRequest.resolve(
@@ -1422,9 +1565,7 @@ describe("SessionBreadcrumb", () => {
         session: makeSession("claude", { message_count: 3 }),
       });
       await flushPromises();
-      expect(
-        sessionsService.getApiV1SessionsIdUsage,
-      ).toHaveBeenCalledTimes(2);
+      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(2);
 
       second.resolve(makeUsage({ has_cost: true, cost_usd: 3.5 }));
       await vi.waitFor(() => {
@@ -1434,12 +1575,9 @@ describe("SessionBreadcrumb", () => {
 
       first.resolve(makeUsage({ has_cost: true, cost_usd: 1 }));
       await flushPromises();
-      expect(
-        document.querySelector(".cost-badge")?.textContent?.trim(),
-      ).toBe("$3.50");
+      expect(document.querySelector(".cost-badge")?.textContent?.trim()).toBe("$3.50");
 
       component.$destroy();
     });
   });
-
 });
