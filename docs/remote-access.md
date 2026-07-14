@@ -375,10 +375,15 @@ with a `{"error":"request timed out"}` body, and affected dashboard panels show
 archives but can be tight for large shared datasets — heatmap, activity, and
 usage summaries scan the full message history.
 
-Raise the deadline with `--write-timeout` (a Go duration):
+Raise the deadline with `--write-timeout` (a Go duration). The flag is available
+on both the local SQLite server and the PostgreSQL read server:
 
 ```bash
+# Local SQLite server
 agentsview serve --write-timeout 120s
+
+# PostgreSQL-backed read server (the multi-tenant / large-dataset case)
+agentsview pg serve --write-timeout 120s
 ```
 
 Set it to `0` to disable the deadline entirely. If aggregates are slow enough to
