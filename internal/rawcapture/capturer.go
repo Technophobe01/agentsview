@@ -597,7 +597,8 @@ func (c *Capturer) observePlan(
 		sourceBytes += info.Size()
 		observed = append(observed, observedCaptureEntry{
 			planned: entry.planned, root: entry.root, relative: entry.relative,
-			file: file, info: info, identity: identity, checkpointIdentity: identity,
+			file: file, info: info, identity: identity,
+			checkpointIdentity: checkpointFileIdentity(file, info),
 		})
 	}
 	return observed, sourceBytes, nil

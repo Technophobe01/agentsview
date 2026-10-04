@@ -282,7 +282,7 @@ func (c *Capturer) captureAppendFile(
 	if !before.Mode().IsRegular() || !stableFileInfo(observed.info, before) ||
 		before.Size() <= base.Length ||
 		beforeIdentity == "" || beforeIdentity != observed.identity ||
-		beforeIdentity != base.FileIdentity {
+		captureCheckpointIdentity(observed) != base.FileIdentity {
 		return rawcheckpoint.CapturedEntry{}, false, ErrSourceChanged
 	}
 	temporary, err := os.CreateTemp(c.store.CaptureTempDir(), "capture-append-*")
@@ -388,7 +388,7 @@ func (c *Capturer) captureReusedFile(
 	}
 	identity := stableFileIdentity(file, before)
 	if !before.Mode().IsRegular() || before.Size() != base.Length ||
-		identity == "" || identity != observed.identity || identity != base.FileIdentity {
+		identity == "" || identity != observed.identity || captureCheckpointIdentity(observed) != base.FileIdentity {
 		return rawcheckpoint.CapturedEntry{}, ErrSourceChanged
 	}
 	hash := sha256.New()

@@ -64,8 +64,6 @@ import (
 	"unsafe"
 
 	"github.com/mattn/go-sqlite3"
-
-	"go.kenn.io/agentsview/internal/volumeid"
 )
 
 const sqliteSnapshotDriverName = "sqlite3"
@@ -96,8 +94,7 @@ func sqliteSnapshotConnectionIdentity(connection *sql.Conn) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Mapped as stableFileIdentity maps it, so the two compare equal.
-	return fmt.Sprintf("%d:%d", volumeid.Stable(uint64(device)), uint64(inode)), nil
+	return fmt.Sprintf("%d:%d", uint64(device), uint64(inode)), nil
 }
 
 func sqliteOnlineBackup(
