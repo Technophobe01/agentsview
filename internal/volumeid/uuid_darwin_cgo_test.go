@@ -21,7 +21,7 @@ import (
 // independent check on the getattrlist reply layout.
 func diskutilVolumeUUID(t *testing.T, mount string) [16]byte {
 	t.Helper()
-	out, err := exec.Command("diskutil", "info", mount).Output()
+	out, err := exec.CommandContext(t.Context(), "diskutil", "info", mount).Output()
 	if err != nil {
 		t.Skipf("diskutil unavailable: %v", err)
 	}
